@@ -417,6 +417,14 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 
 #endif
 
+/**
+ * Enumerate the primary display geometry used by the Windows desktop-sharing backend.
+ *
+ * MONITOR_DEF stores inclusive right and bottom coordinates, while GetDeviceCaps returns pixel
+ * counts. Converting the counts to their final coordinates prevents the capture surface from
+ * extending one row and column beyond the shared desktop, which otherwise corrupts frame memory
+ * during a client update.
+ */
 static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors)
 {
 	HDC hdc;
@@ -433,15 +441,24 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
 	if (EnumDisplayDevices(nullptr, iDevNum, &displayDevice, 0))
 	{
 		hdc = CreateDC(displayDevice.DeviceName, nullptr, nullptr, nullptr);
+		if (!hdc)
+			return 0;
+
 		desktopWidth = GetDeviceCaps(hdc, HORZRES);
 		desktopHeight = GetDeviceCaps(hdc, VERTRES);
+		if ((desktopWidth <= 0) || (desktopHeight <= 0))
+		{
+			DeleteDC(hdc);
+			return 0;
+		}
+
 		index = 0;
 		numMonitors = 1;
 		monitor = &monitors[index];
 		monitor->left = 0;
 		monitor->top = 0;
-		monitor->right = desktopWidth;
-		monitor->bottom = desktopHeight;
+		monitor->right = desktopWidth - 1;
+		monitor->bottom = desktopHeight - 1;
 		monitor->flags = 1;
 		DeleteDC(hdc);
 	}
