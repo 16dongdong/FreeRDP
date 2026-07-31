@@ -21,5 +21,7 @@ set(SRCS remdesk_common.h remdesk_common.c)
 add_library(remdesk-common STATIC ${SRCS})
 set_property(TARGET remdesk-common PROPERTY FOLDER "Channels/${CHANNEL_NAME}/Common")
 
+# 静态归档必须在 GNU 链接器解析到其 WINPR 引用之后再出现，否则 UTF-16 转换符号无法解析。
+target_link_libraries(remdesk-common PUBLIC winpr)
 freerdp_client_pc_add_library_private(remdesk-common)
 channel_install(remdesk-common ${FREERDP_ADDIN_PATH} "FreeRDPTargets")
