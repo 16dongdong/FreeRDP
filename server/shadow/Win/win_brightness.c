@@ -264,7 +264,8 @@ static BOOL win_shadow_brightness_set(winShadowBrightnessController* controller,
 	BSTR className = nullptr;
 	BSTR methodName = nullptr;
 	VARIANT value = WINPR_C_ARRAY_INIT;
-	HRESULT status;
+	const char* operation = "参数校验";
+	HRESULT status = E_INVALIDARG;
 	BOOL success = FALSE;
 
 	if (!controller || !controller->services || !methodPath)
@@ -273,39 +274,51 @@ static BOOL win_shadow_brightness_set(winShadowBrightnessController* controller,
 	className = SysAllocString(L"WmiMonitorBrightnessMethods");
 	methodName = SysAllocString(L"WmiSetBrightness");
 	if (!className || !methodName)
+	{
+		operation = "分配 WMI 方法名称";
+		status = E_OUTOFMEMORY;
 		goto out;
+	}
 
+	operation = "读取 WMI 亮度方法类";
 	status = controller->services->lpVtbl->GetObject(controller->services, className, 0, nullptr,
 	                                                 &methodClass, nullptr);
 	if (FAILED(status))
 		goto out;
 
+	operation = "读取 WmiSetBrightness 签名";
 	status = methodClass->lpVtbl->GetMethod(methodClass, methodName, 0, &inputClass, nullptr);
 	if (FAILED(status))
 		goto out;
 
+	operation = "创建 WmiSetBrightness 参数";
 	status = inputClass->lpVtbl->SpawnInstance(inputClass, 0, &input);
 	if (FAILED(status))
 		goto out;
 
+	operation = "写入 WMI Timeout 参数";
 	value.vt = VT_UI4;
 	value.ulVal = 0;
 	status = input->lpVtbl->Put(input, L"Timeout", 0, &value, 0);
 	if (FAILED(status))
 		goto out;
 
+	operation = "写入 WMI Brightness 参数";
 	value.vt = VT_UI1;
 	value.bVal = brightness;
 	status = input->lpVtbl->Put(input, L"Brightness", 0, &value, 0);
 	if (FAILED(status))
 		goto out;
 
+	operation = "执行 WmiSetBrightness";
 	status = controller->services->lpVtbl->ExecMethod(controller->services, methodPath, methodName, 0,
 	                                                  nullptr, input, &output, nullptr);
 	if (SUCCEEDED(status))
 		success = TRUE;
 
 out:
+	if (!success)
+		WLog_WARN(TAG, "%s 失败: HRESULT 0x%08" PRIX32, operation, (UINT32)status);
 	VariantClear(&value);
 	SysFreeString(className);
 	SysFreeString(methodName);
