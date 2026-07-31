@@ -8,12 +8,10 @@ add_library(
   win_dxgi.h
   win_audio.c
   win_audio.h
-  win_rdp.c
-  win_rdp.h
   win_shadow.c
   win_shadow.h
-  win_wds.c
-  win_wds.h
 )
+# DXGI 桌面复制避免 WDS 的单会话和端口占用限制，是物理桌面共享的首选后端。
+target_compile_definitions(freerdp-shadow-subsystem-impl PRIVATE WITH_DXGI_1_2)
 target_link_libraries(freerdp-shadow-subsystem-impl PRIVATE freerdp-client freerdp winpr ole32
                                                                mmdevapi uuid ksuser)

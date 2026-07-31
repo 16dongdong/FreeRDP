@@ -31,10 +31,13 @@ typedef struct win_shadow_subsystem winShadowSubsystem;
 #include <winpr/stream.h>
 #include <winpr/collections.h>
 
-#include "win_rdp.h"
-#include "win_wds.h"
 #include "win_dxgi.h"
 #include "win_audio.h"
+
+#if !defined(WITH_DXGI_1_2)
+#include "win_rdp.h"
+#include "win_wds.h"
+#endif
 
 struct win_shadow_subsystem
 {

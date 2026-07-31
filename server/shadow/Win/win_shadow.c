@@ -423,11 +423,11 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 	UINT64 frameTime;
 	HANDLE events[32];
 	HANDLE StopEvent;
-	StopEvent = subsystem->server->StopEvent;
+	StopEvent = subsystem->base.server->StopEvent;
 	nCount = 0;
 	events[nCount++] = StopEvent;
 	subsystem->base.captureFrameRate =
-	    (subsystem->server->h264FrameRate < 16) ? subsystem->server->h264FrameRate : 16;
+	    (subsystem->base.server->h264FrameRate < 16) ? subsystem->base.server->h264FrameRate : 16;
 	fps = subsystem->base.captureFrameRate;
 
 	if (fps == 0)
@@ -543,7 +543,42 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
 	int status;
 	MONITOR_DEF* virtualScreen;
+	const MONITOR_DEF* selectedMonitor;
+	INT64 monitorWidth;
+	INT64 monitorHeight;
+
+	if (!subsystem)
+		return -1;
+
 	subsystem->base.numMonitors = win_shadow_enum_monitors(subsystem->base.monitors, 16);
+	if ((subsystem->base.numMonitors < 1) ||
+	    (subsystem->base.selectedMonitor >= subsystem->base.numMonitors))
+	{
+		WLog_ERR(TAG, "未发现可用于物理桌面共享的显示器");
+		return -1;
+	}
+
+	selectedMonitor = &subsystem->base.monitors[subsystem->base.selectedMonitor];
+	monitorWidth = (INT64)selectedMonitor->right - selectedMonitor->left + 1;
+	monitorHeight = (INT64)selectedMonitor->bottom - selectedMonitor->top + 1;
+	if ((monitorWidth < 1) || (monitorWidth > INT32_MAX) || (monitorHeight < 1) ||
+	    (monitorHeight > INT32_MAX))
+	{
+		WLog_ERR(TAG, "物理显示器尺寸无效：%" PRId64 "x%" PRId64, monitorWidth, monitorHeight);
+		return -1;
+	}
+
+	/* DXGI 暂存纹理必须与被共享的显示器完全同尺寸；此前未赋值的零尺寸会导致
+	 * CreateTexture2D 返回 E_INVALIDARG，服务在监听端口前退出。 */
+	subsystem->width = (int)monitorWidth;
+	subsystem->height = (int)monitorHeight;
+	virtualScreen = &(subsystem->base.virtualScreen);
+	virtualScreen->left = 0;
+	virtualScreen->top = 0;
+	virtualScreen->right = subsystem->width - 1;
+	virtualScreen->bottom = subsystem->height - 1;
+	virtualScreen->flags = 1;
+
 #if defined(WITH_WDS_API)
 	status = win_shadow_wds_init(subsystem);
 #elif defined(WITH_DXGI_1_2)
@@ -557,12 +592,6 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	status = win_shadow_audio_init(subsystem);
 	if (status < 0)
 		WLog_WARN(TAG, "系统声音初始化失败，继续仅视频会话");
-	virtualScreen = &(subsystem->base.virtualScreen);
-	virtualScreen->left = 0;
-	virtualScreen->top = 0;
-	virtualScreen->right = subsystem->width;
-	virtualScreen->bottom = subsystem->height;
-	virtualScreen->flags = 1;
 	WLog_INFO(TAG, "width: %d height: %d", subsystem->width, subsystem->height);
 	return 1;
 }

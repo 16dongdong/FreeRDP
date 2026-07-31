@@ -19,7 +19,10 @@
 #ifndef FREERDP_SERVER_SHADOW_WIN_WDS_H
 #define FREERDP_SERVER_SHADOW_WIN_WDS_H
 
+/* DXGI 与 WDS 使用互斥的捕获模型；DXGI 已启用时不得重新打开 WDS 共享会话。 */
+#if !defined(WITH_DXGI_1_2)
 #define WITH_WDS_API 1
+#endif
 
 #ifndef CINTERFACE
 #define CINTERFACE

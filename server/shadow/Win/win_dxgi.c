@@ -496,6 +496,13 @@ int win_shadow_dxgi_uninit(winShadowSubsystem* subsystem)
 	return 1;
 }
 
+/**
+ * 从 DXGI 桌面纹理读取指定矩形的帧数据。
+ *
+ * Shadow 的多显示器拼接依赖 D3D11_BOX 的标准 left/top 坐标语义；此前横纵坐标互换会让非原点
+ * 显示器的图像裁剪错位，并会间接破坏远程输入的视觉对齐。纹理复制、接口查询或映射失败时返回
+ * 负数，设备移除时仅在重新初始化成功后返回零，调用方据此跳过当前帧。
+ */
 int win_shadow_dxgi_fetch_frame_data(winShadowSubsystem* subsystem, BYTE** ppDstData,
                                      int* pnDstStep, int x, int y, int width, int height)
 {
@@ -507,8 +514,8 @@ int win_shadow_dxgi_fetch_frame_data(winShadowSubsystem* subsystem, BYTE** ppDst
 	if ((width * height) < 1)
 		return 0;
 
-	Box.top = x;
-	Box.left = y;
+	Box.left = x;
+	Box.top = y;
 	Box.right = x + width;
 	Box.bottom = y + height;
 	Box.front = 0;
@@ -681,6 +688,13 @@ int win_shadow_dxgi_get_next_frame(winShadowSubsystem* subsystem)
 	return 1;
 }
 
+/**
+ * 将 DXGI 桌面复制的移动和脏矩形合并到 Shadow 表面失效区域。
+ *
+ * DXGI 子系统的服务对象存储在通用基类中，必须通过 base.server 访问；直接访问不存在的派生成员
+ * 会使此前被 WDS 遮蔽的 DXGI 构建路径失败。获取元数据或区域合并失败时返回负数，调用方停止
+ * 本轮捕获并保留已知的表面状态。
+ */
 int win_shadow_dxgi_get_invalid_region(winShadowSubsystem* subsystem)
 {
 	HRESULT hr;
@@ -697,7 +711,7 @@ int win_shadow_dxgi_get_invalid_region(winShadowSubsystem* subsystem)
 	RECT* pDirtyRectsBuffer;
 	DXGI_OUTDUPL_MOVE_RECT* pMoveRect;
 	DXGI_OUTDUPL_MOVE_RECT* pMoveRectBuffer;
-	rdpShadowSurface* surface = subsystem->server->surface;
+	rdpShadowSurface* surface = subsystem->base.server->surface;
 
 	if (subsystem->dxgiFrameInfo.AccumulatedFrames == 0)
 		return 0;
