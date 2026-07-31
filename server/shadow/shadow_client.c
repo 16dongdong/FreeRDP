@@ -520,6 +520,12 @@ static BOOL shadow_send_desktop_resize(rdpShadowClient* client)
 	return rc;
 }
 
+/**
+ * 完成 Shadow 客户端的连接后处理。
+ *
+ * 回调仅在协议和认证协商完成后执行。它保留通道与认证失败的原有返回语义；子系统确认
+ * 客户端已连接后才调用平台激活钩子，避免未经认证的连接影响正在使用的物理桌面。
+ */
 WINPR_ATTR_NODISCARD
 static BOOL shadow_client_post_connect(freerdp_peer* peer)
 {
@@ -595,10 +601,11 @@ static BOOL shadow_client_post_connect(freerdp_peer* peer)
 		}
 	}
 
-	if (subsystem->ClientConnect)
-	{
-		return subsystem->ClientConnect(subsystem, client);
-	}
+	if (subsystem->ClientConnect && !subsystem->ClientConnect(subsystem, client))
+		return FALSE;
+
+	if (subsystem->ClientActivated)
+		subsystem->ClientActivated(subsystem, client);
 
 	return TRUE;
 }

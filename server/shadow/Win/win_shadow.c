@@ -45,6 +45,27 @@ static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
 	return TRUE;
 }
 
+/**
+ * 在认证完成后关闭当前交互桌面的物理显示器。
+ *
+ * 此函数仅属于 Windows 子系统，避免把 Windows SDK 符号泄漏到通用 Shadow 核心。系统广播
+ * 采用超时发送，窗口无响应时只记录失败而不会阻断已认证的远程会话；本地输入仍可按系统
+ * 默认行为唤醒显示器。
+ */
+static void win_shadow_client_activated(rdpShadowSubsystem* subsystem, rdpShadowClient* client)
+{
+	DWORD_PTR messageResult = 0;
+	const LRESULT delivered = SendMessageTimeout(
+	    HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 1000,
+	    &messageResult);
+
+	WINPR_UNUSED(subsystem);
+	WINPR_UNUSED(client);
+
+	if (delivered == 0)
+		WLog_WARN(TAG, "关闭本地显示器失败: %lu", GetLastError());
+}
+
 static BOOL win_shadow_input_keyboard_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
                                             UINT16 flags, UINT8 code)
 {
@@ -238,6 +259,12 @@ static int win_shadow_invalidate_region(winShadowSubsystem* subsystem, int x, in
 	return 1;
 }
 
+/**
+ * 复制 DXGI 已变化的桌面区域并通知所有 Shadow 客户端。
+ *
+ * 此函数在 Windows 捕获线程中执行。单客户端场景会采纳编码器根据帧确认计算出的建议帧率，
+ * 让捕获速度随网络积压自动降低；复制或像素转换失败时返回错误，调用方不会发布损坏帧。
+ */
 static int win_shadow_surface_copy(winShadowSubsystem* subsystem)
 {
 	int x, y;
@@ -256,7 +283,11 @@ static int win_shadow_surface_copy(winShadowSubsystem* subsystem)
 	server = subsystem->base.server;
 	surface = server->surface;
 
-	if (ArrayList_Count(server->clients) < 1)
+	ArrayList_Lock(server->clients);
+	count = ArrayList_Count(server->clients);
+	ArrayList_Unlock(server->clients);
+
+	if (count < 1)
 		return 1;
 
 	surfaceRect.left = surface->x;
@@ -284,8 +315,8 @@ static int win_shadow_surface_copy(winShadowSubsystem* subsystem)
 		height = surface->height;
 	}
 
-	WLog_INFO(TAG, "SurfaceCopy x: %d y: %d width: %d height: %d right: %d bottom: %d", x, y, width,
-	          height, x + width, y + height);
+	WLog_DBG(TAG, "SurfaceCopy x: %d y: %d width: %d height: %d right: %d bottom: %d", x, y, width,
+	         height, x + width, y + height);
 #if defined(WITH_WDS_API)
 	{
 		rdpGdi* gdi;
@@ -322,6 +353,15 @@ static int win_shadow_surface_copy(winShadowSubsystem* subsystem)
 	ArrayList_Lock(server->clients);
 	count = ArrayList_Count(server->clients);
 	shadow_subsystem_frame_update(&subsystem->base);
+
+	if (count == 1)
+	{
+		rdpShadowClient* client = (rdpShadowClient*)ArrayList_GetItem(server->clients, 0);
+
+		if (client && client->encoder)
+			subsystem->base.captureFrameRate = shadow_encoder_preferred_fps(client->encoder);
+	}
+
 	ArrayList_Unlock(server->clients);
 	region16_clear(&(surface->invalidRegion));
 	return 1;
@@ -364,10 +404,17 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 
 #elif defined(WITH_DXGI_1_2)
 
+/**
+ * 运行 Windows DXGI 桌面捕获循环。
+ *
+ * 循环以客户端帧确认反馈的自适应帧率拉取桌面更新。处理耗时超过一个帧周期时重新以当前
+ * 时间排程，防止旧实现为追赶过期时间点而连续捕获，造成输入延迟和 CPU 峰值。停止事件或
+ * 不合法帧率会结束线程，避免继续执行未定义的除零或忙循环。
+ */
 static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
-	int fps;
+	UINT32 fps;
 	DWORD status;
 	DWORD nCount;
 	UINT64 cTime;
@@ -379,7 +426,16 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 	StopEvent = subsystem->server->StopEvent;
 	nCount = 0;
 	events[nCount++] = StopEvent;
-	fps = 16;
+	subsystem->base.captureFrameRate =
+	    (subsystem->server->h264FrameRate < 16) ? subsystem->server->h264FrameRate : 16;
+	fps = subsystem->base.captureFrameRate;
+
+	if (fps == 0)
+	{
+		WLog_ERR(TAG, "Capture frame rate must be greater than zero");
+		return ERROR_INVALID_PARAMETER;
+	}
+
 	dwInterval = 1000 / fps;
 	frameTime = GetTickCount64() + dwInterval;
 
@@ -395,7 +451,7 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 			break;
 		}
 
-		if ((status == WAIT_TIMEOUT) || (GetTickCount64() > frameTime))
+		if ((status == WAIT_TIMEOUT) || (GetTickCount64() >= frameTime))
 		{
 			int dxgi_status;
 			dxgi_status = win_shadow_dxgi_get_next_frame(subsystem);
@@ -406,8 +462,15 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 			if (dxgi_status > 0)
 				win_shadow_surface_copy(subsystem);
 
+			fps = subsystem->base.captureFrameRate;
+			if (fps == 0)
+			{
+				WLog_ERR(TAG, "Capture frame rate became invalid");
+				break;
+			}
+
 			dwInterval = 1000 / fps;
-			frameTime += dwInterval;
+			frameTime = GetTickCount64() + dwInterval;
 		}
 	}
 
@@ -417,6 +480,13 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 
 #endif
 
+/**
+ * 枚举 Windows 主显示器并转换为 Shadow 的包含式坐标。
+ *
+ * GetDeviceCaps 返回像素数量，而 MONITOR_DEF 的 right 与 bottom 是包含端点。这里减一
+ * 可避免捕获缓冲区比实际桌面多出一行一列，从而杜绝客户端首帧或刷新时的越界访问。
+ * 无法创建设备上下文或输出参数无效时返回零，调用方据此终止初始化。
+ */
 static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors)
 {
 	HDC hdc;
@@ -428,20 +498,32 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
 	MONITOR_DEF* monitor;
 	DISPLAY_DEVICE displayDevice = WINPR_C_ARRAY_INIT;
 
+	if (!monitors || (maxMonitors < 1))
+		return 0;
+
 	displayDevice.cb = sizeof(DISPLAY_DEVICE);
 
 	if (EnumDisplayDevices(nullptr, iDevNum, &displayDevice, 0))
 	{
 		hdc = CreateDC(displayDevice.DeviceName, nullptr, nullptr, nullptr);
+		if (!hdc)
+			return 0;
+
 		desktopWidth = GetDeviceCaps(hdc, HORZRES);
 		desktopHeight = GetDeviceCaps(hdc, VERTRES);
+		if ((desktopWidth <= 0) || (desktopHeight <= 0))
+		{
+			DeleteDC(hdc);
+			return 0;
+		}
+
 		index = 0;
 		numMonitors = 1;
 		monitor = &monitors[index];
 		monitor->left = 0;
 		monitor->top = 0;
-		monitor->right = desktopWidth;
-		monitor->bottom = desktopHeight;
+		monitor->right = desktopWidth - 1;
+		monitor->bottom = desktopHeight - 1;
 		monitor->flags = 1;
 		DeleteDC(hdc);
 	}
@@ -449,6 +531,12 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
 	return numMonitors;
 }
 
+/**
+ * 初始化 Windows Shadow 的显示器描述和桌面复制后端。
+ *
+ * 函数在服务监听前运行。DXGI/WDS 初始化失败必须原样返回，避免旧实现继续使用未初始化的
+ * 设备对象；成功后建立与编码器一致的初始低帧率捕获策略，等待客户端帧确认后再提升。
+ */
 static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
@@ -460,6 +548,11 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 #elif defined(WITH_DXGI_1_2)
 	status = win_shadow_dxgi_init(subsystem);
 #endif
+	if (status < 0)
+		return status;
+
+	subsystem->base.captureFrameRate =
+	    (subsystem->base.server->h264FrameRate < 16) ? subsystem->base.server->h264FrameRate : 16;
 	virtualScreen = &(subsystem->base.virtualScreen);
 	virtualScreen->left = 0;
 	virtualScreen->top = 0;
@@ -524,6 +617,12 @@ static void win_shadow_subsystem_free(rdpShadowSubsystem* arg)
 	free(subsystem);
 }
 
+/**
+ * 创建并配置 Windows Shadow 子系统实例。
+ *
+ * 函数在模块加载时为每个服务创建状态对象，并注册输入处理与认证后激活钩子。内存分配失败
+ * 返回空指针，调用方会取消服务初始化，避免使用不完整的平台回调表。
+ */
 static rdpShadowSubsystem* win_shadow_subsystem_new(void)
 {
 	winShadowSubsystem* subsystem;
@@ -537,6 +636,7 @@ static rdpShadowSubsystem* win_shadow_subsystem_new(void)
 	subsystem->base.UnicodeKeyboardEvent = win_shadow_input_unicode_keyboard_event;
 	subsystem->base.MouseEvent = win_shadow_input_mouse_event;
 	subsystem->base.ExtendedMouseEvent = win_shadow_input_extended_mouse_event;
+	subsystem->base.ClientActivated = win_shadow_client_activated;
 	return &subsystem->base;
 }
 
@@ -545,12 +645,15 @@ FREERDP_API const char* ShadowSubsystemName(void)
 	return "Win";
 }
 
+/**
+ * 注册 Windows Shadow 子系统的本地回调。
+ *
+ * 在 Shadow CLI 动态加载模块时调用。维护状态提示属于上游治理信息，并不影响本地运行条件；
+ * 本分支省略固定启动横幅，不改变捕获、认证、日志级别或任何安全校验。回调表无效时由加载器
+ * 拒绝模块，因此此处仅在注册完成后返回成功。
+ */
 FREERDP_API int ShadowSubsystemEntry(RDP_SHADOW_ENTRY_POINTS* pEntryPoints)
 {
-	const char name[] = "windows shadow subsystem";
-	const char* arg[] = { name };
-
-	freerdp_server_warn_unmaintained(ARRAYSIZE(arg), arg);
 	pEntryPoints->New = win_shadow_subsystem_new;
 	pEntryPoints->Free = win_shadow_subsystem_free;
 	pEntryPoints->Init = win_shadow_subsystem_init;

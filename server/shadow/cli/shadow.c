@@ -55,6 +55,8 @@ int main(int argc, char** argv)
 		  "Select or list monitors" },
 		{ "max-connections", COMMAND_LINE_VALUE_REQUIRED, "<number>", nullptr, nullptr, -1, nullptr,
 		  "maximum connections allowed to server, 0 to deactivate" },
+		{ "max-fps", COMMAND_LINE_VALUE_REQUIRED, "<1-60>", nullptr, nullptr, -1, nullptr,
+		  "设置捕获与视频编码的最高帧率；客户端积压时会自动降帧" },
 		{ "mouse-relative", COMMAND_LINE_VALUE_BOOL, nullptr, nullptr, nullptr, -1, nullptr,
 		  "enable support for relative mouse events" },
 		{ "rect", COMMAND_LINE_VALUE_REQUIRED, "<x,y,w,h>", nullptr, nullptr, -1, nullptr,

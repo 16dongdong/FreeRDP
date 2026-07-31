@@ -126,8 +126,11 @@ message("FREERDP_VERSION=${FREERDP_VERSION_FULL}")
 
 message(STATUS "Git Revision ${GIT_REVISION}")
 
-# MSVC compatibility with system headers
-add_compile_definitions(NONAMELESSUNION)
+# NONAMELESSUNION 仅用于 MSVC 系统头兼容。MinGW 定义它会破坏匿名联合成员访问，
+# 进而影响 Windows 输入注入与 COM 结构，因此必须限制在 MSVC 构建。
+if(MSVC)
+  add_compile_definitions(NONAMELESSUNION)
+endif()
 
 # Make the detected version available as default version for all subprojects
 set(FREERDP_DEFAULT_PROJECT_VERSION ${FREERDP_VERSION} CACHE STRING INTERNAL)

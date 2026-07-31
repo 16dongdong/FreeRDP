@@ -47,8 +47,11 @@ if(NOT FREERDP_UNIFIED_BUILD)
     set(DEFAULT_DEBUG_OPTION "OFF" CACHE INTERNAL "debug default")
   endif()
 
-  # MSVC compatibility with system headers
-  add_compile_definitions(NONAMELESSUNION)
+  # NONAMELESSUNION 仅用于 MSVC 系统头兼容。MinGW 定义它会破坏匿名联合成员访问，
+  # 进而影响 Windows 输入注入与 COM 结构，因此必须限制在 MSVC 构建。
+  if(MSVC)
+    add_compile_definitions(NONAMELESSUNION)
+  endif()
 
   set(OPENSSL_FEATURE_TYPE "RECOMMENDED")
   set(OPENSSL_FEATURE_PURPOSE "cryptography")

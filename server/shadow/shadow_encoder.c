@@ -466,6 +466,13 @@ static int shadow_encoder_uninit(rdpShadowEncoder* encoder)
 	return 1;
 }
 
+/**
+ * 重置客户端的视频编码器状态。
+ *
+ * 在显示器尺寸或已协商编解码器变化后调用。帧率上限从服务端配置读取，使编码器、捕获器
+ * 与 H.264 参数保持一致；初始化帧率较低，随后依据客户端帧确认逐步提升。初始化失败时
+ * 返回负数，调用方必须停止本次会话更新。
+ */
 int shadow_encoder_reset(rdpShadowEncoder* encoder)
 {
 	int status = 0;
@@ -487,8 +494,8 @@ int shadow_encoder_reset(rdpShadowEncoder* encoder)
 	if (status < 0)
 		return -1;
 
-	encoder->fps = 16;
-	encoder->maxFps = 32;
+	encoder->maxFps = encoder->server->h264FrameRate;
+	encoder->fps = (encoder->maxFps < 16) ? encoder->maxFps : 16;
 	encoder->frameId = 0;
 	encoder->lastAckframeId = 0;
 	encoder->frameAck = freerdp_settings_get_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled);
@@ -570,6 +577,12 @@ int shadow_encoder_prepare(rdpShadowEncoder* encoder, UINT32 codecs)
 	return 1;
 }
 
+/**
+ * 为一个已连接的 Shadow 客户端创建独立编码器。
+ *
+ * 编码器持有客户端与服务端引用，并从服务端帧率策略初始化自适应上限；分配或编码器
+ * 初始化失败时返回空指针，调用方应拒绝该客户端而不是继续使用不完整上下文。
+ */
 rdpShadowEncoder* shadow_encoder_new(rdpShadowClient* client)
 {
 	rdpShadowEncoder* encoder = nullptr;
@@ -581,8 +594,8 @@ rdpShadowEncoder* shadow_encoder_new(rdpShadowClient* client)
 
 	encoder->client = client;
 	encoder->server = server;
-	encoder->fps = 16;
-	encoder->maxFps = 32;
+	encoder->maxFps = server->h264FrameRate;
+	encoder->fps = (encoder->maxFps < 16) ? encoder->maxFps : 16;
 
 	if (shadow_encoder_init(encoder) < 0)
 	{

@@ -208,6 +208,13 @@ int shadow_server_command_line_status_print(rdpShadowServer* server, int argc, c
 	return 1;
 }
 
+/**
+ * 解析 Shadow 服务端命令行配置。
+ *
+ * 此函数在监听器与编码器初始化前运行，将用户输入转换为服务端状态。max-fps 同时约束
+ * DXGI 捕获节奏和 H.264 编码帧率，避免捕获速度超过客户端确认能力而产生无效积压。
+ * 无效数值返回命令行错误，调用方不得启动部分配置的服务。
+ */
 int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** argv,
                                      COMMAND_LINE_ARGUMENT_A* cargs)
 {
@@ -301,6 +308,17 @@ int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** a
 			if ((errno != 0) || (val > UINT32_MAX))
 				return fail_at(arg, COMMAND_LINE_ERROR);
 			server->maxClientsConnected = val;
+		}
+		CommandLineSwitchCase(arg, "max-fps")
+		{
+			char* end = nullptr;
+			errno = 0;
+			const unsigned long val = strtoul(arg->Value, &end, 10);
+
+			if ((errno != 0) || !end || (*end != '\0') || (val < 1) || (val > 60))
+				return fail_at(arg, COMMAND_LINE_ERROR);
+
+			server->h264FrameRate = (UINT32)val;
 		}
 		CommandLineSwitchCase(arg, "rect")
 		{

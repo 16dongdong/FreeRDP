@@ -80,6 +80,9 @@ extern "C"
 	typedef BOOL (*pfnShadowClientConnect)(rdpShadowSubsystem* subsystem, rdpShadowClient* client);
 	typedef void (*pfnShadowClientDisconnect)(rdpShadowSubsystem* subsystem,
 	                                          rdpShadowClient* client);
+	/** 在客户端认证并连接到子系统后执行平台特定操作。 */
+	typedef void (*pfnShadowClientActivated)(rdpShadowSubsystem* subsystem,
+	                                         rdpShadowClient* client);
 	typedef BOOL (*pfnShadowClientCapabilities)(rdpShadowSubsystem* subsystem,
 	                                            rdpShadowClient* client);
 
@@ -253,6 +256,7 @@ extern "C"
 		WINPR_ATTR_NODISCARD pfnShadowAuthenticate Authenticate;
 		WINPR_ATTR_NODISCARD pfnShadowClientConnect ClientConnect;
 		pfnShadowClientDisconnect ClientDisconnect;
+		pfnShadowClientActivated ClientActivated;
 		WINPR_ATTR_NODISCARD pfnShadowClientCapabilities ClientCapabilities;
 
 		rdpShadowServer* server;
@@ -269,7 +273,8 @@ extern "C"
 
 	struct S_SHADOW_MSG_OUT
 	{
-		int refCount;
+		/* 该计数由 Windows/WinPR 的 Interlocked API 并发读写，必须匹配其 volatile LONG 契约。 */
+		volatile LONG refCount;
 		MSG_OUT_FREE_FN Free;
 	};
 
