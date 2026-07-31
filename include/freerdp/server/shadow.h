@@ -81,7 +81,7 @@ extern "C"
 	typedef void (*pfnShadowClientDisconnect)(rdpShadowSubsystem* subsystem,
 	                                          rdpShadowClient* client);
 	/**
-	 * 在客户端完成 RDP Activate 并已调度首帧刷新后执行平台特定操作。
+	 * 在客户端完成 RDP Activate 且首帧已成功发送后执行平台特定操作。
 	 *
 	 * 此回调不得阻塞握手线程；它用于依赖已建立图形管线的平台行为，例如延后息屏。
 	 */
@@ -149,14 +149,19 @@ extern "C"
 		BOOL areGfxCapsReady; /** @since version 3.3.0 */
 		RDPGFX_CAPSET confirmedCaps; /** @since version 3.25.0 */
 
-		/* 智能缩放保留客户端请求的桌面尺寸，同时把物理桌面等比映射到输出区域。 */
+		/* 服务端在编码前把物理桌面等比绘制到访问端尺寸的黑底缓冲区。 */
 		BOOL smartSizing;
+		BOOL platformReadyNotified;
 		UINT32 sourceWidth;
 		UINT32 sourceHeight;
+		UINT32 frameWidth;
+		UINT32 frameHeight;
 		UINT32 outputOriginX;
 		UINT32 outputOriginY;
 		UINT32 outputWidth;
 		UINT32 outputHeight;
+		UINT32 scaledFrameStride;
+		BYTE* scaledFrame;
 	};
 
 	struct rdp_shadow_server

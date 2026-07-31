@@ -116,13 +116,31 @@ static BOOL BitmapUpdateProxyEx(rdpShadowClient* client, const BITMAP_UPDATE* bi
 }
 
 /**
- * 根据访问端桌面和物理桌面的宽高比计算等比输出区域。
+ * 判断 RDPSND 是否已经完成访问端格式协商。
  *
- * Windows Shadow 不能为每个访问端改变物理显示模式，否则 DXGI Desktop Duplication 会重建。
- * 因此保留客户端请求的逻辑桌面尺寸，并在其中居中放置物理桌面，剩余区域由客户端显示为黑边。
+ * Activated 是回调函数指针而不是协商状态；以它判定会在连接阶段持续向未就绪通道发送音频，
+ * 阻塞同一客户端线程中的 GFX 首帧。这里只允许已选择且仍位于客户端格式数组内的格式发送。
+ */
+static BOOL shadow_client_rdpsnd_ready(const rdpShadowClient* client)
+{
+	if (!client || !client->rdpsnd)
+		return FALSE;
+
+	return (client->rdpsnd->selected_client_format != UINT16_MAX) &&
+	       (client->rdpsnd->selected_client_format < client->rdpsnd->num_client_formats);
+}
+
+/**
+ * 创建访问端尺寸的服务端缩放缓冲区并计算等比输出区域。
+ *
+ * RDPGFX MapSurfaceToScaledOutput 在部分 mstsc 版本上不会完成首帧呈现，导致访问端一直停留在
+ * “配置远程电脑”。这里改为在编码前生成访问端尺寸的黑底帧，再通过标准 surface 映射发送；
+ * 物理显示模式和 DXGI 拓扑均保持不变。H.264 使用偶数画布，奇数逻辑尺寸仅保留最后一行黑边，
+ * 避免 4:2:0 编码器拒绝首帧。
  */
 static BOOL shadow_client_configure_smart_sizing(rdpShadowClient* client)
 {
+	size_t frameBufferSize;
 	UINT32 desktopWidth;
 	UINT32 desktopHeight;
 	UINT32 sourceWidth;
@@ -151,31 +169,50 @@ static BOOL shadow_client_configure_smart_sizing(rdpShadowClient* client)
 	                                   : server->surface->height;
 	if (!desktopWidth || !desktopHeight || !sourceWidth || !sourceHeight)
 		return FALSE;
+	if (desktopWidth > (UINT32_MAX / 4U))
+		return FALSE;
 
 	client->sourceWidth = sourceWidth;
 	client->sourceHeight = sourceHeight;
-	if ((UINT64)desktopWidth * sourceHeight <= (UINT64)desktopHeight * sourceWidth)
+	client->frameWidth = desktopWidth & ~1U;
+	client->frameHeight = desktopHeight & ~1U;
+	if ((client->frameWidth < 2U) || (client->frameHeight < 2U))
+		return FALSE;
+
+	client->scaledFrameStride = desktopWidth * 4U;
+	if (desktopHeight > (SIZE_MAX / client->scaledFrameStride))
+		return FALSE;
+	frameBufferSize = (size_t)desktopHeight * client->scaledFrameStride;
+	client->scaledFrame = (BYTE*)calloc(1, frameBufferSize);
+	if (!client->scaledFrame)
+		return FALSE;
+
+	if ((UINT64)client->frameWidth * sourceHeight <= (UINT64)client->frameHeight * sourceWidth)
 	{
-		client->outputWidth = desktopWidth;
+		client->outputWidth = client->frameWidth;
 		client->outputHeight =
-		    WINPR_ASSERTING_INT_CAST(UINT32, (UINT64)desktopWidth * sourceHeight / sourceWidth);
+		    WINPR_ASSERTING_INT_CAST(UINT32,
+		                             (UINT64)client->frameWidth * sourceHeight / sourceWidth);
 	}
 	else
 	{
-		client->outputHeight = desktopHeight;
+		client->outputHeight = client->frameHeight;
 		client->outputWidth =
-		    WINPR_ASSERTING_INT_CAST(UINT32, (UINT64)desktopHeight * sourceWidth / sourceHeight);
+		    WINPR_ASSERTING_INT_CAST(UINT32,
+		                             (UINT64)client->frameHeight * sourceWidth / sourceHeight);
 	}
 
 	client->outputWidth = MAX(client->outputWidth, 1U);
 	client->outputHeight = MAX(client->outputHeight, 1U);
-	client->outputOriginX = (desktopWidth - client->outputWidth) / 2U;
-	client->outputOriginY = (desktopHeight - client->outputHeight) / 2U;
+	client->outputOriginX = (client->frameWidth - client->outputWidth) / 2U;
+	client->outputOriginY = (client->frameHeight - client->outputHeight) / 2U;
 	WLog_INFO(TAG,
-	          "访问端智能缩放：物理桌面 %" PRIu32 "x%" PRIu32 " -> 输出 (%" PRIu32 ",%" PRIu32
-	          ") %" PRIu32 "x%" PRIu32 "，逻辑桌面 %" PRIu32 "x%" PRIu32,
+	          "服务端等比缩放：物理桌面 %" PRIu32 "x%" PRIu32 " -> 输出 (%" PRIu32 ",%" PRIu32
+	          ") %" PRIu32 "x%" PRIu32 "，编码画布 %" PRIu32 "x%" PRIu32 "，逻辑桌面 %" PRIu32
+	          "x%" PRIu32,
 	          sourceWidth, sourceHeight, client->outputOriginX, client->outputOriginY,
-	          client->outputWidth, client->outputHeight, desktopWidth, desktopHeight);
+	          client->outputWidth, client->outputHeight, client->frameWidth, client->frameHeight,
+	          desktopWidth, desktopHeight);
 	return TRUE;
 }
 
@@ -198,13 +235,18 @@ static UINT16 shadow_client_map_pointer_coordinate(UINT32 position, UINT32 sourc
 	return WINPR_ASSERTING_INT_CAST(UINT16, MIN(scaled, UINT16_MAX));
 }
 
+/**
+ * 创建并映射访问端的主图形 surface。
+ *
+ * 智能缩放帧已经在服务端生成，因此这里只使用标准 MapSurfaceToOutput；奇数逻辑尺寸对应的
+ * surface 会收窄到编码器可接受的偶数画布，剩余边缘由访问端桌面背景保持为黑色。
+ */
 WINPR_ATTR_NODISCARD
 static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 {
 	UINT error = CHANNEL_RC_OK;
 	RDPGFX_CREATE_SURFACE_PDU createSurface;
 	RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU surfaceToOutput;
-	RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU scaledSurfaceToOutput;
 	RdpgfxServerContext* context = nullptr;
 	rdpSettings* settings = nullptr;
 
@@ -216,16 +258,14 @@ static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 
 	WINPR_ASSERT(client->server);
 	WINPR_ASSERT(client->server->surface);
-	const UINT32 sourceWidth =
-	    client->smartSizing ? client->sourceWidth
-	                        : freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-	const UINT32 sourceHeight =
-	    client->smartSizing ? client->sourceHeight
-	                        : freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
-	WINPR_ASSERT(sourceWidth <= UINT16_MAX);
-	WINPR_ASSERT(sourceHeight <= UINT16_MAX);
-	createSurface.width = (UINT16)sourceWidth;
-	createSurface.height = (UINT16)sourceHeight;
+	const UINT32 desktopWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 desktopHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	const UINT32 surfaceWidth = client->smartSizing ? client->frameWidth : desktopWidth;
+	const UINT32 surfaceHeight = client->smartSizing ? client->frameHeight : desktopHeight;
+	WINPR_ASSERT(surfaceWidth <= UINT16_MAX);
+	WINPR_ASSERT(surfaceHeight <= UINT16_MAX);
+	createSurface.width = (UINT16)surfaceWidth;
+	createSurface.height = (UINT16)surfaceHeight;
 	createSurface.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
 	createSurface.surfaceId = client->surfaceId;
 	surfaceToOutput.outputOriginX = 0;
@@ -240,20 +280,7 @@ static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 		return FALSE;
 	}
 
-	if (client->smartSizing)
-	{
-		scaledSurfaceToOutput.surfaceId = client->surfaceId;
-		scaledSurfaceToOutput.reserved = 0;
-		scaledSurfaceToOutput.outputOriginX = client->outputOriginX;
-		scaledSurfaceToOutput.outputOriginY = client->outputOriginY;
-		scaledSurfaceToOutput.targetWidth = client->outputWidth;
-		scaledSurfaceToOutput.targetHeight = client->outputHeight;
-		IFCALLRET(context->MapSurfaceToScaledOutput, error, context, &scaledSurfaceToOutput);
-	}
-	else
-	{
-		IFCALLRET(context->MapSurfaceToOutput, error, context, &surfaceToOutput);
-	}
+	IFCALLRET(context->MapSurfaceToOutput, error, context, &surfaceToOutput);
 
 	if (error)
 	{
@@ -345,6 +372,12 @@ static inline void shadow_client_free_queued_message(void* obj)
 	}
 }
 
+/**
+ * 释放单个 Shadow 客户端上下文及其服务端缩放资源。
+ *
+ * 函数由通用 peer 销毁路径调用；允许服务或列表已经部分释放，并确保缩放帧、编码器、消息队列
+ * 和同步对象各自只在本上下文中回收。
+ */
 static void shadow_client_context_free(freerdp_peer* peer, rdpContext* context)
 {
 	rdpShadowClient* client = (rdpShadowClient*)context;
@@ -358,6 +391,8 @@ static void shadow_client_context_free(freerdp_peer* peer, rdpContext* context)
 	if (server && server->clients)
 		ArrayList_Remove(server->clients, (void*)client);
 
+	free(client->scaledFrame);
+	client->scaledFrame = nullptr;
 	shadow_encoder_free(client->encoder);
 
 	/* Clear queued messages and free resource */
@@ -851,22 +886,17 @@ static BOOL shadow_client_suppress_output(rdpContext* context, BYTE allow, const
 /**
  * 完成 RDP 图形激活并调度首帧刷新。
  *
- * 桌面尺寸协商完成后先重置编码器并请求完整画面，再通知平台执行非协议性动作。这样息屏等
- * Windows 行为不会干扰客户端的激活 PDU、GFX 管线或首个关键帧；刷新请求失败时返回 FALSE，
- * 且不会触发平台回调。
+ * 桌面尺寸协商完成后只重置编码器并请求完整画面。平台动作要等发送函数确认首帧成功后触发，
+ * 避免息屏或亮度调整与激活 PDU、GFX 管线及首个关键帧竞争；刷新请求失败时返回 FALSE。
  */
 WINPR_ATTR_NODISCARD
 static BOOL shadow_client_activate(freerdp_peer* peer)
 {
-	BOOL refreshScheduled;
-	rdpShadowSubsystem* subsystem;
-
 	WINPR_ASSERT(peer);
 
 	rdpShadowClient* client = (rdpShadowClient*)peer->context;
 	WINPR_ASSERT(client);
-	subsystem = client->subsystem;
-	WINPR_ASSERT(subsystem);
+	WINPR_ASSERT(client->subsystem);
 
 	/* Resize client if necessary */
 	if (shadow_client_recalc_desktop_size(client))
@@ -882,15 +912,7 @@ static BOOL shadow_client_activate(freerdp_peer* peer)
 		return FALSE;
 	}
 
-	/* 先安排首个全屏刷新，再执行与图形管线无关的平台动作。 */
-	refreshScheduled = shadow_client_refresh_rect(&client->context, 0, nullptr);
-	if (!refreshScheduled)
-		return FALSE;
-
-	if (subsystem->ClientActivated)
-		subsystem->ClientActivated(subsystem, client);
-
-	return TRUE;
+	return shadow_client_refresh_rect(&client->context, 0, nullptr);
 }
 
 WINPR_ATTR_NODISCARD
@@ -2354,14 +2376,18 @@ out:
 }
 
 /**
- * Function description
+ * 把当前无效区域发送给访问端，并在首帧成功后通知平台层。
  *
- * @return TRUE on success (or nothing need to be updated)
+ * 智能缩放连接先将完整物理桌面等比绘制到访问端尺寸的黑底缓冲区，再走标准 GFX surface；
+ * 这样既不改变本机显示拓扑，也不依赖会让部分 mstsc 停在配置阶段的 scaled-output PDU。
+ * 任一缩放、编码或发送操作失败都返回 FALSE；未产生实际画面更新时仍返回 TRUE。
  */
 WINPR_ATTR_NODISCARD
 static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GFX_STATUS* pStatus)
 {
+	BOOL frameSent = FALSE;
 	BOOL ret = TRUE;
+	BOOL surfaceLocked = FALSE;
 	INT64 nXSrc = 0;
 	INT64 nYSrc = 0;
 	INT64 nWidth = 0;
@@ -2405,6 +2431,7 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 	}
 
 	EnterCriticalSection(&surface->lock);
+	surfaceLocked = TRUE;
 	rects = region16_rects(&(surface->invalidRegion), &numRects);
 
 	for (UINT32 index = 0; index < numRects; index++)
@@ -2467,13 +2494,32 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 	{
 		if (pStatus->gfxOpened && client->areGfxCapsReady)
 		{
+			const BYTE* frameData = pSrcData;
+			UINT32 frameFormat = SrcFormat;
+			UINT32 frameStep = nSrcStep;
+
 			/* GFX/h264 always full screen encoded */
-			nWidth = client->smartSizing
-			             ? client->sourceWidth
-			             : freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-			nHeight = client->smartSizing
-			              ? client->sourceHeight
-			              : freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+			if (client->smartSizing)
+			{
+				ret = freerdp_image_scale(client->scaledFrame, PIXEL_FORMAT_BGRX32,
+				                          client->scaledFrameStride, client->outputOriginX,
+				                          client->outputOriginY, client->outputWidth,
+				                          client->outputHeight, pSrcData, SrcFormat, nSrcStep, 0, 0,
+				                          client->sourceWidth, client->sourceHeight);
+				if (!ret)
+					goto out;
+
+				frameData = client->scaledFrame;
+				frameFormat = PIXEL_FORMAT_BGRX32;
+				frameStep = client->scaledFrameStride;
+				nWidth = client->frameWidth;
+				nHeight = client->frameHeight;
+			}
+			else
+			{
+				nWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+				nHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+			}
 
 			/* Create primary surface if have not */
 			if (!pStatus->gfxSurfaceCreated)
@@ -2492,8 +2538,9 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 			WINPR_ASSERT(nWidth <= UINT16_MAX);
 			WINPR_ASSERT(nHeight >= 0);
 			WINPR_ASSERT(nHeight <= UINT16_MAX);
-			ret = shadow_client_send_surface_gfx(client, pSrcData, nSrcStep, SrcFormat, 0, 0,
+			ret = shadow_client_send_surface_gfx(client, frameData, frameStep, frameFormat, 0, 0,
 			                                     (UINT16)nWidth, (UINT16)nHeight);
+			frameSent = ret;
 		}
 		else
 		{
@@ -2512,6 +2559,7 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 		WINPR_ASSERT(nHeight <= UINT16_MAX);
 		ret = shadow_client_send_surface_bits(client, pSrcData, nSrcStep, (UINT16)nXSrc,
 		                                      (UINT16)nYSrc, (UINT16)nWidth, (UINT16)nHeight);
+		frameSent = ret;
 	}
 	else
 	{
@@ -2525,11 +2573,20 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 		WINPR_ASSERT(nHeight <= UINT16_MAX);
 		ret = shadow_client_send_bitmap_update(client, pSrcData, nSrcStep, (UINT16)nXSrc,
 		                                       (UINT16)nYSrc, (UINT16)nWidth, (UINT16)nHeight);
+		frameSent = ret;
 	}
 
 out:
-	LeaveCriticalSection(&surface->lock);
+	if (surfaceLocked)
+		LeaveCriticalSection(&surface->lock);
 	region16_uninit(&invalidRegion);
+	if (frameSent && client->activated && !client->platformReadyNotified)
+	{
+		client->platformReadyNotified = TRUE;
+		WLog_INFO(TAG, "首帧已成功发送，开始执行本机隐私策略");
+		if (client->subsystem->ClientActivated)
+			client->subsystem->ClientActivated(client->subsystem, client);
+	}
 	return ret;
 }
 
@@ -2730,7 +2787,7 @@ static int shadow_client_subsystem_process_message(rdpShadowClient* client, wMes
 
 			WINPR_ASSERT(msg);
 
-			if (client->activated && client->rdpsnd && client->rdpsnd->Activated)
+			if (client->activated && shadow_client_rdpsnd_ready(client))
 			{
 				client->rdpsnd->src_format = msg->audio_format;
 
@@ -2749,7 +2806,7 @@ static int shadow_client_subsystem_process_message(rdpShadowClient* client, wMes
 			const SHADOW_MSG_OUT_AUDIO_OUT_VOLUME* msg =
 			    (const SHADOW_MSG_OUT_AUDIO_OUT_VOLUME*)message->wParam;
 
-			if (client->activated && client->rdpsnd && client->rdpsnd->Activated)
+			if (client->activated && shadow_client_rdpsnd_ready(client))
 			{
 				const UINT error = IFCALLRESULT(CHANNEL_RC_OK, client->rdpsnd->SetVolume,
 				                                client->rdpsnd, msg->left, msg->right);

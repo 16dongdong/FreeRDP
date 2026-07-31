@@ -321,7 +321,7 @@ static void win_shadow_privacy_uninit(winShadowSubsystem* subsystem)
 }
 
 /**
- * 在 RDP 图形会话激活后安排本机显示器调暗。
+ * 在首个远程画面成功发送后安排本机显示器调暗。
  *
  * 该调用只向已就绪的控制线程投递消息，绝不阻塞图形握手；客户端断开不会恢复亮度，只有本机
  * 物理键鼠钩子会恢复它。
@@ -891,7 +891,7 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
-	/* Windows 物理桌面尺寸固定；由 RDPGFX 在访问端输出区域内等比缩放，避免改变 DXGI 拓扑。 */
+	/* Windows 物理桌面尺寸固定；编码前在黑底缓冲区等比缩放，避免改变 DXGI 拓扑。 */
 	subsystem->base.server->SmartSizing = TRUE;
 	subsystem->base.numMonitors = win_shadow_enum_monitors(subsystem->base.monitors, 16);
 	if ((subsystem->base.numMonitors < 1) ||
