@@ -55,12 +55,12 @@ static LONG smartcard_unpack_redir_scard_context_(wLog* log, wStream* s,
                                                   UINT32* ppbContextNdrPtr, const char* file,
                                                   const char* function, size_t line);
 static LONG smartcard_pack_redir_scard_context(wLog* log, wStream* s,
-                                               const REDIR_SCARDCONTEXT* context, DWORD* index);
+                                               const REDIR_SCARDCONTEXT* context, UINT32* index);
 static LONG smartcard_unpack_redir_scard_handle_(wLog* log, wStream* s, REDIR_SCARDHANDLE* handle,
                                                  UINT32* index, const char* file,
                                                  const char* function, size_t line);
 static LONG smartcard_pack_redir_scard_handle(wLog* log, wStream* s,
-                                              const REDIR_SCARDHANDLE* handle, DWORD* index);
+                                              const REDIR_SCARDHANDLE* handle, UINT32* index);
 static LONG smartcard_unpack_redir_scard_context_ref(wLog* log, wStream* s, UINT32 pbContextNdrPtr,
                                                      REDIR_SCARDCONTEXT* context);
 static LONG smartcard_pack_redir_scard_context_ref(wLog* log, wStream* s,
@@ -217,6 +217,13 @@ static LONG smartcard_ndr_read(wLog* log, wStream* s, BYTE** data, size_t min, s
 	return smartcard_ndr_read_ex(log, s, data, min, elementSize, type, nullptr);
 }
 
+/**
+ * 写入 NDR 32 位引用指针并推进其序号。
+ *
+ * NDR 协议中的指针序号固定为无符号 32 位值，必须与所有封包调用方统一使用 UINT32，而不能
+ * 使用 Windows 的 DWORD。两者虽同为 32 位却不是同一 C 类型；新 GCC 会拒绝混用的指针，
+ * 且强制转换会破坏严格别名约束。流空间不足时返回 FALSE，不写入部分指针数据。
+ */
 static BOOL smartcard_ndr_pointer_write(wStream* s, UINT32* index, DWORD length)
 {
 	const UINT32 ndrPtr = 0x20000 + (*index) * 4;
@@ -1908,7 +1915,7 @@ LONG smartcard_unpack_redir_scard_context_(wLog* log, wStream* s, REDIR_SCARDCON
 }
 
 LONG smartcard_pack_redir_scard_context(WINPR_ATTR_UNUSED wLog* log, wStream* s,
-                                        const REDIR_SCARDCONTEXT* context, DWORD* index)
+                                        const REDIR_SCARDCONTEXT* context, UINT32* index)
 {
 	const UINT32 pbContextNdrPtr = 0x00020000 + *index * 4;
 
@@ -2000,7 +2007,7 @@ LONG smartcard_unpack_redir_scard_handle_(wLog* log, wStream* s, REDIR_SCARDHAND
 }
 
 LONG smartcard_pack_redir_scard_handle(WINPR_ATTR_UNUSED wLog* log, wStream* s,
-                                       const REDIR_SCARDHANDLE* handle, DWORD* index)
+                                       const REDIR_SCARDHANDLE* handle, UINT32* index)
 {
 	const UINT32 pbContextNdrPtr = 0x00020000 + *index * 4;
 
@@ -2101,7 +2108,7 @@ LONG smartcard_pack_establish_context_return(wStream* s, const EstablishContext_
 	WINPR_ASSERT(ret);
 	wLog* log = scard_log();
 	LONG status = 0;
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_establish_context_return(log, ret);
 	if (ret->ReturnCode != SCARD_S_SUCCESS)
@@ -2190,7 +2197,7 @@ LONG smartcard_pack_list_reader_groups_call(wStream* s, const ListReaderGroups_C
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_list_reader_groups_call(log, call, unicode);
 
@@ -2428,7 +2435,7 @@ LONG smartcard_unpack_connect_w_call(wStream* s, ConnectW_Call* call)
 LONG smartcard_pack_connect_return(wStream* s, const Connect_Return* ret)
 {
 	LONG status = 0;
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	WINPR_ASSERT(ret);
 	wLog* log = scard_log();
@@ -2498,7 +2505,7 @@ LONG smartcard_pack_reconnect_call(wStream* s, const Reconnect_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_reconnect_call(log, call);
 
@@ -2990,7 +2997,7 @@ LONG smartcard_pack_status_call(wStream* s, const Status_Call* call, BOOL unicod
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_status_call(log, call, unicode);
 
@@ -3796,7 +3803,7 @@ LONG smartcard_pack_set_attrib_call(wStream* s, const SetAttrib_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_set_attrib_call(log, call);
 
@@ -4317,7 +4324,7 @@ LONG smartcard_pack_context_call(wStream* s, const Context_Call* call, const cha
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_context_call(log, call, name);
 
@@ -4332,7 +4339,7 @@ LONG smartcard_pack_list_readers_call(wStream* s, const ListReaders_Call* call, 
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_list_readers_call(log, call, unicode);
 
@@ -4457,7 +4464,7 @@ LONG smartcard_pack_get_status_change_a_call(wStream* s, const GetStatusChangeA_
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_get_status_change_a_call(log, call);
 
@@ -4492,7 +4499,7 @@ LONG smartcard_pack_get_status_change_w_call(wStream* s, const GetStatusChangeW_
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_get_status_change_w_call(log, call);
 
@@ -4527,7 +4534,7 @@ LONG smartcard_pack_connect_a_call(wStream* s, const ConnectA_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_connect_a_call(log, call);
 
@@ -4560,7 +4567,7 @@ LONG smartcard_pack_connect_w_call(wStream* s, const ConnectW_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_connect_w_call(log, call);
 
@@ -4593,7 +4600,7 @@ LONG smartcard_pack_control_call(wStream* s, const Control_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_control_call(log, call);
 
@@ -4639,7 +4646,7 @@ LONG smartcard_pack_hcard_and_disposition_call(wStream* s, const HCardAndDisposi
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_hcard_and_disposition_call(log, call, name);
 
@@ -4667,7 +4674,7 @@ LONG smartcard_pack_transmit_call(wStream* s, const Transmit_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_transmit_call(log, call);
 
@@ -4757,7 +4764,7 @@ LONG smartcard_pack_get_attrib_call(wStream* s, const GetAttrib_Call* call)
 {
 	WINPR_ASSERT(call);
 	wLog* log = scard_log();
-	DWORD index = 0;
+	UINT32 index = 0;
 
 	smartcard_trace_get_attrib_call(log, call);
 
