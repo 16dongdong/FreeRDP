@@ -80,7 +80,11 @@ extern "C"
 	typedef BOOL (*pfnShadowClientConnect)(rdpShadowSubsystem* subsystem, rdpShadowClient* client);
 	typedef void (*pfnShadowClientDisconnect)(rdpShadowSubsystem* subsystem,
 	                                          rdpShadowClient* client);
-	/** 在客户端认证并连接到子系统后执行平台特定操作。 */
+	/**
+	 * 在客户端完成 RDP Activate 并已调度首帧刷新后执行平台特定操作。
+	 *
+	 * 此回调不得阻塞握手线程；它用于依赖已建立图形管线的平台行为，例如延后息屏。
+	 */
 	typedef void (*pfnShadowClientActivated)(rdpShadowSubsystem* subsystem,
 	                                         rdpShadowClient* client);
 	typedef BOOL (*pfnShadowClientCapabilities)(rdpShadowSubsystem* subsystem,

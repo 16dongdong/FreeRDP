@@ -524,7 +524,8 @@ static BOOL shadow_send_desktop_resize(rdpShadowClient* client)
  * 完成 Shadow 客户端的连接后处理。
  *
  * 回调仅在协议和认证协商完成后执行。它保留通道与认证失败的原有返回语义；子系统确认
- * 客户端已连接后才调用平台激活钩子，避免未经认证的连接影响正在使用的物理桌面。
+ * 该阶段只处理协议、通道与认证；任何会改变物理桌面状态的操作必须等待 RDP Activate 和首帧
+ * 刷新已经排队，避免在客户端“正在配置远程主机”期间重置桌面捕获。
  */
 WINPR_ATTR_NODISCARD
 static BOOL shadow_client_post_connect(freerdp_peer* peer)
@@ -603,9 +604,6 @@ static BOOL shadow_client_post_connect(freerdp_peer* peer)
 
 	if (subsystem->ClientConnect && !subsystem->ClientConnect(subsystem, client))
 		return FALSE;
-
-	if (subsystem->ClientActivated)
-		subsystem->ClientActivated(subsystem, client);
 
 	return TRUE;
 }
@@ -721,13 +719,25 @@ static BOOL shadow_client_suppress_output(rdpContext* context, BYTE allow, const
 	return shadow_client_refresh_request(client);
 }
 
+/**
+ * 完成 RDP 图形激活并调度首帧刷新。
+ *
+ * 桌面尺寸协商完成后先重置编码器并请求完整画面，再通知平台执行非协议性动作。这样息屏等
+ * Windows 行为不会干扰客户端的激活 PDU、GFX 管线或首个关键帧；刷新请求失败时返回 FALSE，
+ * 且不会触发平台回调。
+ */
 WINPR_ATTR_NODISCARD
 static BOOL shadow_client_activate(freerdp_peer* peer)
 {
+	BOOL refreshScheduled;
+	rdpShadowSubsystem* subsystem;
+
 	WINPR_ASSERT(peer);
 
 	rdpShadowClient* client = (rdpShadowClient*)peer->context;
 	WINPR_ASSERT(client);
+	subsystem = client->subsystem;
+	WINPR_ASSERT(subsystem);
 
 	/* Resize client if necessary */
 	if (shadow_client_recalc_desktop_size(client))
@@ -743,8 +753,15 @@ static BOOL shadow_client_activate(freerdp_peer* peer)
 		return FALSE;
 	}
 
-	/* Update full screen in next update */
-	return shadow_client_refresh_rect(&client->context, 0, nullptr);
+	/* 先安排首个全屏刷新，再执行与图形管线无关的平台动作。 */
+	refreshScheduled = shadow_client_refresh_rect(&client->context, 0, nullptr);
+	if (!refreshScheduled)
+		return FALSE;
+
+	if (subsystem->ClientActivated)
+		subsystem->ClientActivated(subsystem, client);
+
+	return TRUE;
 }
 
 WINPR_ATTR_NODISCARD

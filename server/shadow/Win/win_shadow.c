@@ -31,6 +31,7 @@
 
 #define TAG SERVER_TAG("shadow.win")
 #define SHADOW_CAPTURE_INITIAL_FPS 30U
+#define SHADOW_DISPLAY_BLANK_DELAY_MS 1500U
 
 /* https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mouse_event
  * does not mention this flag is only supported if building for _WIN32_WINNT >= 0x0600
@@ -47,24 +48,56 @@ static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
 }
 
 /**
- * 在认证完成后关闭当前交互桌面的物理显示器。
+ * 关闭当前交互桌面的物理显示器。
  *
- * 此函数仅属于 Windows 子系统，避免把 Windows SDK 符号泄漏到通用 Shadow 核心。系统广播
- * 采用超时发送，窗口无响应时只记录失败而不会阻断已认证的远程会话；本地输入仍可按系统
- * 默认行为唤醒显示器。
+ * 仅发送关闭命令，不会在远程会话断开时重新点亮屏幕；Windows 的原生物理键鼠活动仍可唤醒
+ * 显示器。广播带有超时，任一窗口无响应时不会阻塞 RDP 协议线程。
  */
-static void win_shadow_client_activated(rdpShadowSubsystem* subsystem, rdpShadowClient* client)
+static void win_shadow_blank_local_display(void)
 {
 	DWORD_PTR messageResult = 0;
 	const LRESULT delivered = SendMessageTimeout(
 	    HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 1000,
 	    &messageResult);
 
+	if (delivered == 0)
+		WLog_WARN(TAG, "关闭本地显示器失败: %lu", GetLastError());
+}
+
+/**
+ * 在首帧有机会送达后异步执行息屏。
+ *
+ * 此线程不持有客户端或子系统指针，因此服务在延迟窗口内停止时也不会访问已释放内存。延迟将
+ * DXGI 显示状态切换从 RDP 激活路径移开，避免客户端长时间停留在“正在配置远程主机”。
+ */
+static DWORD WINAPI win_shadow_deferred_display_blank_thread(void* arg)
+{
+	WINPR_UNUSED(arg);
+	Sleep(SHADOW_DISPLAY_BLANK_DELAY_MS);
+	win_shadow_blank_local_display();
+	return 0;
+}
+
+/**
+ * 在 RDP 图形会话激活后安排本地息屏。
+ *
+ * 创建的线程立即脱离调用方，故不会阻塞握手；线程创建失败只记录告警，远程会话仍可正常使用。
+ */
+static void win_shadow_client_activated(rdpShadowSubsystem* subsystem, rdpShadowClient* client)
+{
+	HANDLE blankThread =
+	    CreateThread(nullptr, 0, win_shadow_deferred_display_blank_thread, nullptr, 0, nullptr);
+
 	WINPR_UNUSED(subsystem);
 	WINPR_UNUSED(client);
 
-	if (delivered == 0)
-		WLog_WARN(TAG, "关闭本地显示器失败: %lu", GetLastError());
+	if (!blankThread)
+	{
+		WLog_WARN(TAG, "创建延后息屏线程失败: %lu", GetLastError());
+		return;
+	}
+
+	CloseHandle(blankThread);
 }
 
 static BOOL win_shadow_input_keyboard_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
