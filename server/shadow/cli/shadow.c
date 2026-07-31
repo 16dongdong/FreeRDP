@@ -64,6 +64,8 @@ int main(int argc, char** argv)
 		  "maximum connections allowed to server, 0 to deactivate" },
 		{ "max-fps", COMMAND_LINE_VALUE_REQUIRED, "<1-60>", nullptr, nullptr, -1, nullptr,
 		  "设置捕获与视频编码的最高帧率；客户端积压时会自动降帧" },
+		{ "h264-bitrate", COMMAND_LINE_VALUE_REQUIRED, "<1000000-50000000>", nullptr, nullptr,
+		  -1, nullptr, "设置 H.264 VBR 目标码率（bit/s），用于在带宽允许时提高桌面细节" },
 		{ "system-audio", COMMAND_LINE_VALUE_BOOL, nullptr, BoolValueTrue, nullptr, -1, nullptr,
 		  "采集并重定向 Windows 系统声音" },
 		{ "mouse-relative", COMMAND_LINE_VALUE_BOOL, nullptr, nullptr, nullptr, -1, nullptr,

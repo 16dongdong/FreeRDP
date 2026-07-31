@@ -27,48 +27,74 @@
 #include <freerdp/log.h>
 #define TAG CLIENT_TAG("shadow")
 
+/* 两帧以内是 RDPGFX 正常的传输流水线，不应据此降低交互桌面的帧率。 */
+#define SHADOW_ENCODER_TARGET_QUEUE_DEPTH 2U
+#define SHADOW_ENCODER_INTERACTIVE_START_FPS 30U
+#define SHADOW_ENCODER_FPS_RAMP_STEP 4U
+
+/**
+ * 计算交互式物理桌面共享的初始编码帧率。
+ *
+ * 新客户端刚建立时尚无帧确认，使用 30 fps 起步可避免旧实现从 16 fps 缓慢爬升造成的首段卡顿；
+ * maxFps 是经过命令行校验的服务上限。无效的零上限保持为零，由调用方按既有失败语义处理。
+ */
+static UINT32 shadow_encoder_initial_fps(UINT32 maxFps)
+{
+	return MIN(maxFps, SHADOW_ENCODER_INTERACTIVE_START_FPS);
+}
+
+/**
+ * 返回捕获线程应采用的当前编码帧率。
+ *
+ * 此函数由 Windows 物理桌面捕获循环在客户端帧确认之后读取；速率由创建帧标识时更新。编码器
+ * 生命周期由调用方保证有效，本函数不分配资源也不改变状态。
+ */
 UINT32 shadow_encoder_preferred_fps(rdpShadowEncoder* encoder)
 {
-	/* Return preferred fps calculated according to the last
-	 * sent frame id and last client-acknowledged frame id.
-	 */
 	return encoder->fps;
 }
 
+/**
+ * 获取客户端实际排队的未完成帧数量。
+ *
+ * RDPGFX 帧确认携带 queueDepth，它比仅根据帧号差推断更准确：网络往返期间存在少量未确认帧是
+ * 正常流水线，而非客户端解码积压。旧客户端未提供该字段时才退回到帧号差；暂停确认时返回零，
+ * 使调用方维持最高帧率而非将其误判为无限积压。
+ */
 UINT32 shadow_encoder_inflight_frames(rdpShadowEncoder* encoder)
 {
-	/* Return in-flight frame count.
-	 * If queueDepth is SUSPEND_FRAME_ACKNOWLEDGEMENT, count = 0
-	 * Otherwise, calculate count =
-	 * <last sent frame id> - <last client-acknowledged frame id>
-	 * Note: This function is exported so that subsystem could
-	 * implement its own strategy to tune fps.
-	 */
-	return (encoder->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT)
-	           ? 0
-	           : encoder->frameId - encoder->lastAckframeId;
+	if (encoder->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT)
+		return 0;
+
+	if (encoder->queueDepth != QUEUE_DEPTH_UNAVAILABLE)
+		return encoder->queueDepth;
+
+	return encoder->frameId - encoder->lastAckframeId;
 }
 
+/**
+ * 分配下一帧标识并按客户端队列反馈调节编码速度。
+ *
+ * 正常的两帧流水线内以每帧 4 fps 的速度快速升至 maxFps；超过该阈值时按队列深度平滑回退，
+ * 既避免网络抖动时堆积旧画面，也不会像旧实现一样因两帧确认延迟突然降到三分之一帧率。返回值
+ * 为单调递增的 RDP 帧标识，编码器状态无效时的零帧率仍由下游保护为 1 fps。
+ */
 UINT32 shadow_encoder_create_frame_id(rdpShadowEncoder* encoder)
 {
 	UINT32 frameId = 0;
 	UINT32 inFlightFrames = shadow_encoder_inflight_frames(encoder);
 
-	/*
-	 * Calculate preferred fps according to how much frames are
-	 * in-progress. Note that it only works when subsystem implementation
-	 * calls shadow_encoder_preferred_fps and takes the suggestion.
-	 */
-	if (inFlightFrames > 1)
+	if (inFlightFrames > SHADOW_ENCODER_TARGET_QUEUE_DEPTH)
 	{
-		encoder->fps = (100 / (inFlightFrames + 1) * encoder->maxFps) / 100;
+		const UINT32 denominator = inFlightFrames + 1;
+		encoder->fps = (denominator == 0)
+		                   ? 1
+		                   : (encoder->maxFps * SHADOW_ENCODER_TARGET_QUEUE_DEPTH) / denominator;
 	}
-	else
+	else if (encoder->fps < encoder->maxFps)
 	{
-		encoder->fps += 2;
-
-		if (encoder->fps > encoder->maxFps)
-			encoder->fps = encoder->maxFps;
+		const UINT32 remaining = encoder->maxFps - encoder->fps;
+		encoder->fps += MIN(remaining, SHADOW_ENCODER_FPS_RAMP_STEP);
 	}
 
 	if (encoder->fps < 1)
@@ -495,7 +521,7 @@ int shadow_encoder_reset(rdpShadowEncoder* encoder)
 		return -1;
 
 	encoder->maxFps = encoder->server->h264FrameRate;
-	encoder->fps = (encoder->maxFps < 16) ? encoder->maxFps : 16;
+	encoder->fps = shadow_encoder_initial_fps(encoder->maxFps);
 	encoder->frameId = 0;
 	encoder->lastAckframeId = 0;
 	encoder->frameAck = freerdp_settings_get_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled);
@@ -595,7 +621,7 @@ rdpShadowEncoder* shadow_encoder_new(rdpShadowClient* client)
 	encoder->client = client;
 	encoder->server = server;
 	encoder->maxFps = server->h264FrameRate;
-	encoder->fps = (encoder->maxFps < 16) ? encoder->maxFps : 16;
+	encoder->fps = shadow_encoder_initial_fps(encoder->maxFps);
 
 	if (shadow_encoder_init(encoder) < 0)
 	{

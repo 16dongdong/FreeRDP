@@ -44,6 +44,11 @@
 
 #define TAG SERVER_TAG("shadow")
 
+#define SHADOW_DEFAULT_H264_BITRATE 18000000U
+#define SHADOW_DEFAULT_H264_FRAMERATE 60U
+#define SHADOW_MIN_H264_BITRATE 1000000U
+#define SHADOW_MAX_H264_BITRATE 50000000U
+
 static const char bind_address[] = "bind-address,";
 
 #define fail_at(arg, rc) fail_at_((arg), (rc), __FILE__, __func__, __LINE__)
@@ -211,10 +216,10 @@ int shadow_server_command_line_status_print(rdpShadowServer* server, int argc, c
 /**
  * 解析 Shadow 服务端命令行配置。
  *
- * 此函数在监听器与编码器初始化前运行，将用户输入转换为服务端状态。max-fps 同时约束
- * DXGI 捕获节奏和 H.264 编码帧率，避免捕获速度超过客户端确认能力而产生无效积压；
- * system-audio 控制 Windows 系统声音回环，关闭时不创建音频线程。无效数值返回命令行错误，
- * 调用方不得启动部分配置的服务。
+ * 此函数在监听器与编码器初始化前运行，将用户输入转换为服务端状态。max-fps 与 h264-bitrate
+ * 分别约束 DXGI 捕获节奏和 H.264 VBR 码率，避免捕获速度超过客户端确认能力或画面质量受默认
+ * 低码率限制；system-audio 控制 Windows 系统声音回环，关闭时不创建音频线程。无效数值返回
+ * 命令行错误，调用方不得启动部分配置的服务。
  */
 int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** argv,
                                      COMMAND_LINE_ARGUMENT_A* cargs)
@@ -324,6 +329,18 @@ int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** a
 				return fail_at(arg, COMMAND_LINE_ERROR);
 
 			server->h264FrameRate = (UINT32)val;
+		}
+		CommandLineSwitchCase(arg, "h264-bitrate")
+		{
+			char* end = nullptr;
+			errno = 0;
+			const unsigned long val = strtoul(arg->Value, &end, 10);
+
+			if ((errno != 0) || !end || (*end != '\0') || (val < SHADOW_MIN_H264_BITRATE) ||
+			    (val > SHADOW_MAX_H264_BITRATE))
+				return fail_at(arg, COMMAND_LINE_ERROR);
+
+			server->h264BitRate = (UINT32)val;
 		}
 		CommandLineSwitchCase(arg, "rect")
 		{
@@ -1164,8 +1181,8 @@ rdpShadowServer* shadow_server_new(void)
 	server->mayInteract = TRUE;
 	server->systemAudio = TRUE;
 	server->h264RateControlMode = H264_RATECONTROL_VBR;
-	server->h264BitRate = 10000000;
-	server->h264FrameRate = 30;
+	server->h264BitRate = SHADOW_DEFAULT_H264_BITRATE;
+	server->h264FrameRate = SHADOW_DEFAULT_H264_FRAMERATE;
 	server->h264QP = 0;
 	server->authentication = TRUE;
 #if defined(WITH_GFX_AV1)

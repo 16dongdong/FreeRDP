@@ -30,6 +30,7 @@
 #include "win_shadow.h"
 
 #define TAG SERVER_TAG("shadow.win")
+#define SHADOW_CAPTURE_INITIAL_FPS 30U
 
 /* https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mouse_event
  * does not mention this flag is only supported if building for _WIN32_WINNT >= 0x0600
@@ -426,8 +427,10 @@ static DWORD WINAPI win_shadow_subsystem_thread(LPVOID arg)
 	StopEvent = subsystem->base.server->StopEvent;
 	nCount = 0;
 	events[nCount++] = StopEvent;
-	subsystem->base.captureFrameRate =
-	    (subsystem->base.server->h264FrameRate < 16) ? subsystem->base.server->h264FrameRate : 16;
+	subsystem->base.captureFrameRate = (subsystem->base.server->h264FrameRate <
+	                                    SHADOW_CAPTURE_INITIAL_FPS)
+	                                       ? subsystem->base.server->h264FrameRate
+	                                       : SHADOW_CAPTURE_INITIAL_FPS;
 	fps = subsystem->base.captureFrameRate;
 
 	if (fps == 0)
@@ -587,8 +590,10 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	if (status < 0)
 		return status;
 
-	subsystem->base.captureFrameRate =
-	    (subsystem->base.server->h264FrameRate < 16) ? subsystem->base.server->h264FrameRate : 16;
+	subsystem->base.captureFrameRate = (subsystem->base.server->h264FrameRate <
+	                                    SHADOW_CAPTURE_INITIAL_FPS)
+	                                       ? subsystem->base.server->h264FrameRate
+	                                       : SHADOW_CAPTURE_INITIAL_FPS;
 	status = win_shadow_audio_init(subsystem);
 	if (status < 0)
 		WLog_WARN(TAG, "系统声音初始化失败，继续仅视频会话");
