@@ -14,6 +14,8 @@
 #include "win_shadow.h"
 
 #include <windows.h>
+/* MinGW 的 uuid 导入库不包含 WASAPI/KSMEDIA 全部 GUID，在本翻译单元生成定义避免链接缺口。 */
+#include <initguid.h>
 #ifdef WAVE_FORMAT_OPUS
 #undef WAVE_FORMAT_OPUS
 #endif

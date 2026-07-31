@@ -38,7 +38,7 @@ extern "C"
 	 * 数据会在函数内部复制并异步释放，因此调用方可在返回后立即复用捕获缓冲区。格式必须在
 	 * 所有客户端消息处理完成前保持有效；无客户端或格式无效时返回 FALSE。
 	 */
-	WINPR_ATTR_NODISCARD BOOL shadow_client_broadcast_audio_samples(
+	WINPR_ATTR_NODISCARD FREERDP_API BOOL shadow_client_broadcast_audio_samples(
 	    rdpShadowServer* server, const AUDIO_FORMAT* format, const void* samples, size_t frameCount,
 	    UINT16 timestamp);
 

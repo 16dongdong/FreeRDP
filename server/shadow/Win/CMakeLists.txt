@@ -16,4 +16,4 @@ add_library(
   win_wds.h
 )
 target_link_libraries(freerdp-shadow-subsystem-impl PRIVATE freerdp-client freerdp winpr ole32
-                                                               mmdevapi uuid)
+                                                               mmdevapi uuid ksuser)
