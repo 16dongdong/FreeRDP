@@ -260,6 +260,7 @@ static BOOL win_shadow_brightness_set(winShadowBrightnessController* controller,
 	IWbemClassObject* methodClass = nullptr;
 	IWbemClassObject* inputClass = nullptr;
 	IWbemClassObject* input = nullptr;
+	IWbemClassObject* output = nullptr;
 	BSTR className = nullptr;
 	BSTR methodName = nullptr;
 	VARIANT value = WINPR_C_ARRAY_INIT;
@@ -300,7 +301,7 @@ static BOOL win_shadow_brightness_set(winShadowBrightnessController* controller,
 		goto out;
 
 	status = controller->services->lpVtbl->ExecMethod(controller->services, methodPath, methodName, 0,
-	                                                  nullptr, input, nullptr, nullptr);
+	                                                  nullptr, input, &output, nullptr);
 	if (SUCCEEDED(status))
 		success = TRUE;
 
@@ -308,6 +309,8 @@ out:
 	VariantClear(&value);
 	SysFreeString(className);
 	SysFreeString(methodName);
+	if (output)
+		output->lpVtbl->Release(output);
 	if (input)
 		input->lpVtbl->Release(input);
 	if (inputClass)

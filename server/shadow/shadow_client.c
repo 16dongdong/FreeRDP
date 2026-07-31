@@ -115,12 +115,96 @@ static BOOL BitmapUpdateProxyEx(rdpShadowClient* client, const BITMAP_UPDATE* bi
 	return TRUE;
 }
 
+/**
+ * 根据访问端桌面和物理桌面的宽高比计算等比输出区域。
+ *
+ * Windows Shadow 不能为每个访问端改变物理显示模式，否则 DXGI Desktop Duplication 会重建。
+ * 因此保留客户端请求的逻辑桌面尺寸，并在其中居中放置物理桌面，剩余区域由客户端显示为黑边。
+ */
+static BOOL shadow_client_configure_smart_sizing(rdpShadowClient* client)
+{
+	UINT32 desktopWidth;
+	UINT32 desktopHeight;
+	UINT32 sourceWidth;
+	UINT32 sourceHeight;
+	rdpSettings* settings;
+	rdpShadowServer* server;
+
+	WINPR_ASSERT(client);
+	server = client->server;
+	settings = client->context.settings;
+	WINPR_ASSERT(server);
+	WINPR_ASSERT(server->surface);
+	WINPR_ASSERT(settings);
+
+	client->smartSizing =
+	    server->SmartSizing &&
+	    freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline);
+	if (!client->smartSizing)
+		return TRUE;
+
+	desktopWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	desktopHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	sourceWidth = server->shareSubRect ? (server->subRect.right - server->subRect.left)
+	                                  : server->surface->width;
+	sourceHeight = server->shareSubRect ? (server->subRect.bottom - server->subRect.top)
+	                                   : server->surface->height;
+	if (!desktopWidth || !desktopHeight || !sourceWidth || !sourceHeight)
+		return FALSE;
+
+	client->sourceWidth = sourceWidth;
+	client->sourceHeight = sourceHeight;
+	if ((UINT64)desktopWidth * sourceHeight <= (UINT64)desktopHeight * sourceWidth)
+	{
+		client->outputWidth = desktopWidth;
+		client->outputHeight =
+		    WINPR_ASSERTING_INT_CAST(UINT32, (UINT64)desktopWidth * sourceHeight / sourceWidth);
+	}
+	else
+	{
+		client->outputHeight = desktopHeight;
+		client->outputWidth =
+		    WINPR_ASSERTING_INT_CAST(UINT32, (UINT64)desktopHeight * sourceWidth / sourceHeight);
+	}
+
+	client->outputWidth = MAX(client->outputWidth, 1U);
+	client->outputHeight = MAX(client->outputHeight, 1U);
+	client->outputOriginX = (desktopWidth - client->outputWidth) / 2U;
+	client->outputOriginY = (desktopHeight - client->outputHeight) / 2U;
+	WLog_INFO(TAG,
+	          "访问端智能缩放：物理桌面 %" PRIu32 "x%" PRIu32 " -> 输出 (%" PRIu32 ",%" PRIu32
+	          ") %" PRIu32 "x%" PRIu32 "，逻辑桌面 %" PRIu32 "x%" PRIu32,
+	          sourceWidth, sourceHeight, client->outputOriginX, client->outputOriginY,
+	          client->outputWidth, client->outputHeight, desktopWidth, desktopHeight);
+	return TRUE;
+}
+
+/**
+ * 把物理桌面上的指针位置映射到访问端的等比输出区域。
+ *
+ * 仅变换位置，不改变服务端保存的物理坐标；这样缓存比较和本机指针采集仍使用同一坐标系。
+ */
+static UINT16 shadow_client_map_pointer_coordinate(UINT32 position, UINT32 sourceSize,
+                                                   UINT32 outputOrigin, UINT32 outputSize)
+{
+	UINT64 scaled;
+
+	if ((sourceSize <= 1U) || (outputSize <= 1U))
+		return WINPR_ASSERTING_INT_CAST(UINT16, outputOrigin);
+
+	position = MIN(position, sourceSize - 1U);
+	scaled = (UINT64)position * (outputSize - 1U) + (sourceSize - 1U) / 2U;
+	scaled = outputOrigin + scaled / (sourceSize - 1U);
+	return WINPR_ASSERTING_INT_CAST(UINT16, MIN(scaled, UINT16_MAX));
+}
+
 WINPR_ATTR_NODISCARD
 static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 {
 	UINT error = CHANNEL_RC_OK;
 	RDPGFX_CREATE_SURFACE_PDU createSurface;
 	RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU surfaceToOutput;
+	RDPGFX_MAP_SURFACE_TO_SCALED_OUTPUT_PDU scaledSurfaceToOutput;
 	RdpgfxServerContext* context = nullptr;
 	rdpSettings* settings = nullptr;
 
@@ -130,10 +214,18 @@ static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 	settings = ((rdpContext*)client)->settings;
 	WINPR_ASSERT(settings);
 
-	WINPR_ASSERT(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) <= UINT16_MAX);
-	WINPR_ASSERT(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight) <= UINT16_MAX);
-	createSurface.width = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-	createSurface.height = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	WINPR_ASSERT(client->server);
+	WINPR_ASSERT(client->server->surface);
+	const UINT32 sourceWidth =
+	    client->smartSizing ? client->sourceWidth
+	                        : freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 sourceHeight =
+	    client->smartSizing ? client->sourceHeight
+	                        : freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	WINPR_ASSERT(sourceWidth <= UINT16_MAX);
+	WINPR_ASSERT(sourceHeight <= UINT16_MAX);
+	createSurface.width = (UINT16)sourceWidth;
+	createSurface.height = (UINT16)sourceHeight;
 	createSurface.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
 	createSurface.surfaceId = client->surfaceId;
 	surfaceToOutput.outputOriginX = 0;
@@ -148,7 +240,20 @@ static inline BOOL shadow_client_rdpgfx_new_surface(rdpShadowClient* client)
 		return FALSE;
 	}
 
-	IFCALLRET(context->MapSurfaceToOutput, error, context, &surfaceToOutput);
+	if (client->smartSizing)
+	{
+		scaledSurfaceToOutput.surfaceId = client->surfaceId;
+		scaledSurfaceToOutput.reserved = 0;
+		scaledSurfaceToOutput.outputOriginX = client->outputOriginX;
+		scaledSurfaceToOutput.outputOriginY = client->outputOriginY;
+		scaledSurfaceToOutput.targetWidth = client->outputWidth;
+		scaledSurfaceToOutput.targetHeight = client->outputHeight;
+		IFCALLRET(context->MapSurfaceToScaledOutput, error, context, &scaledSurfaceToOutput);
+	}
+	else
+	{
+		IFCALLRET(context->MapSurfaceToOutput, error, context, &surfaceToOutput);
+	}
 
 	if (error)
 	{
@@ -188,6 +293,7 @@ static inline BOOL shadow_client_rdpgfx_reset_graphic(rdpShadowClient* client)
 {
 	UINT error = CHANNEL_RC_OK;
 	RDPGFX_RESET_GRAPHICS_PDU pdu = WINPR_C_ARRAY_INIT;
+	MONITOR_DEF logicalMonitor = WINPR_C_ARRAY_INIT;
 	RdpgfxServerContext* context = nullptr;
 	rdpSettings* settings = nullptr;
 
@@ -202,8 +308,19 @@ static inline BOOL shadow_client_rdpgfx_reset_graphic(rdpShadowClient* client)
 
 	pdu.width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
 	pdu.height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
-	pdu.monitorCount = client->subsystem->numMonitors;
-	pdu.monitorDefArray = client->subsystem->monitors;
+	if (client->smartSizing)
+	{
+		logicalMonitor.right = WINPR_ASSERTING_INT_CAST(INT32, pdu.width - 1U);
+		logicalMonitor.bottom = WINPR_ASSERTING_INT_CAST(INT32, pdu.height - 1U);
+		logicalMonitor.flags = 1;
+		pdu.monitorCount = 1;
+		pdu.monitorDefArray = &logicalMonitor;
+	}
+	else
+	{
+		pdu.monitorCount = client->subsystem->numMonitors;
+		pdu.monitorDefArray = client->subsystem->monitors;
+	}
 	IFCALLRET(context->ResetGraphics, error, context, &pdu);
 
 	if (error)
@@ -380,10 +497,16 @@ static inline void shadow_client_mark_invalid(rdpShadowClient* client, UINT32 nu
 	else
 	{
 		RECTANGLE_16 screenRegion = WINPR_C_ARRAY_INIT;
-		WINPR_ASSERT(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) <= UINT16_MAX);
-		WINPR_ASSERT(freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight) <= UINT16_MAX);
-		screenRegion.right = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-		screenRegion.bottom = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+		const UINT32 width = client->smartSizing
+		                         ? client->sourceWidth
+		                         : freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+		const UINT32 height = client->smartSizing
+		                          ? client->sourceHeight
+		                          : freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+		WINPR_ASSERT(width <= UINT16_MAX);
+		WINPR_ASSERT(height <= UINT16_MAX);
+		screenRegion.right = (UINT16)width;
+		screenRegion.bottom = (UINT16)height;
 		if (!region16_union_rect(&(client->invalidRegion), &(client->invalidRegion), &screenRegion))
 			goto fail;
 	}
@@ -392,10 +515,10 @@ fail:
 }
 
 /**
- * Function description
- * Recalculate client desktop size and update to rdpSettings
+ * 判断是否需要把访问端桌面强制调整为捕获源尺寸。
  *
- * @return TRUE if width/height changed.
+ * 智能缩放客户端保留其请求的逻辑桌面尺寸，物理桌面尺寸由 RDPGFX 源表面独立承载；旧图形路径
+ * 继续沿用原来的桌面调整行为。
  */
 WINPR_ATTR_NODISCARD
 static inline BOOL shadow_client_recalc_desktop_size(rdpShadowClient* client)
@@ -413,6 +536,9 @@ static inline BOOL shadow_client_recalc_desktop_size(rdpShadowClient* client)
 	WINPR_ASSERT(server);
 	WINPR_ASSERT(server->surface);
 	WINPR_ASSERT(settings);
+
+	if (client->smartSizing)
+		return FALSE;
 
 	WINPR_ASSERT(server->surface->width <= UINT16_MAX);
 	WINPR_ASSERT(server->surface->height <= UINT16_MAX);
@@ -571,6 +697,9 @@ static BOOL shadow_client_post_connect(freerdp_peer* peer)
 	          peer->hostname, freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
 	          freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight),
 	          freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth));
+
+	if (!shadow_client_configure_smart_sizing(client))
+		return FALSE;
 
 	if (shadow_client_channels_post_connect(client) != CHANNEL_RC_OK)
 		return FALSE;
@@ -2339,8 +2468,12 @@ static BOOL shadow_client_send_surface_update(rdpShadowClient* client, SHADOW_GF
 		if (pStatus->gfxOpened && client->areGfxCapsReady)
 		{
 			/* GFX/h264 always full screen encoded */
-			nWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-			nHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+			nWidth = client->smartSizing
+			             ? client->sourceWidth
+			             : freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+			nHeight = client->smartSizing
+			              ? client->sourceHeight
+			              : freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
 
 			/* Create primary surface if have not */
 			if (!pStatus->gfxSurfaceCreated)
@@ -2518,6 +2651,15 @@ static int shadow_client_subsystem_process_message(rdpShadowClient* client, wMes
 			{
 				pointerPosition.xPos -= client->server->subRect.left;
 				pointerPosition.yPos -= client->server->subRect.top;
+			}
+			if (client->smartSizing)
+			{
+				pointerPosition.xPos = shadow_client_map_pointer_coordinate(
+				    pointerPosition.xPos, client->sourceWidth, client->outputOriginX,
+				    client->outputWidth);
+				pointerPosition.yPos = shadow_client_map_pointer_coordinate(
+				    pointerPosition.yPos, client->sourceHeight, client->outputOriginY,
+				    client->outputHeight);
 			}
 
 			if (client->activated)

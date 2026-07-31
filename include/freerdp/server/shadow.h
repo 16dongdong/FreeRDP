@@ -148,6 +148,15 @@ extern "C"
 		UINT32 resizeHeight;
 		BOOL areGfxCapsReady; /** @since version 3.3.0 */
 		RDPGFX_CAPSET confirmedCaps; /** @since version 3.25.0 */
+
+		/* 智能缩放保留客户端请求的桌面尺寸，同时把物理桌面等比映射到输出区域。 */
+		BOOL smartSizing;
+		UINT32 sourceWidth;
+		UINT32 sourceHeight;
+		UINT32 outputOriginX;
+		UINT32 outputOriginY;
+		UINT32 outputWidth;
+		UINT32 outputHeight;
 	};
 
 	struct rdp_shadow_server
@@ -189,6 +198,7 @@ extern "C"
 		size_t maxClientsConnected;
 		BOOL SupportMultiRectBitmapUpdates; /** @since version 3.13.0 */
 		BOOL ShowMouseCursor;               /** @since version 3.15.0 */
+		BOOL SmartSizing;
 #if defined(WITH_GFX_AV1)
 		FREERDP_AV1_RATECONTROL AV1RateControlMode; /** @since version 3.15.0 */
 		UINT32 AV1BitRate;                          /** @since version 3.15.0 */

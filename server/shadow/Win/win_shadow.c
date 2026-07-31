@@ -335,12 +335,12 @@ static void win_shadow_client_activated(rdpShadowSubsystem* arg, rdpShadowClient
 
 	if (!subsystem->privacyWindow || !subsystem->privacyThreadId)
 	{
-		WLog_WARN(TAG, "本机隐私遮罩不可用，未改变显示状态");
+		WLog_WARN(TAG, "本机显示器亮度控制不可用，未改变显示状态");
 		return;
 	}
 
 	if (!PostThreadMessage(subsystem->privacyThreadId, WM_SHADOW_PRIVACY_SCHEDULE, 0, 0))
-		WLog_WARN(TAG, "安排本机隐私遮罩失败: %lu", GetLastError());
+		WLog_WARN(TAG, "安排本机显示器调暗失败: %lu", GetLastError());
 }
 
 /**
@@ -404,6 +404,44 @@ static BOOL win_shadow_input_unicode_keyboard_event(rdpShadowSubsystem* subsyste
 	return TRUE;
 }
 
+/**
+ * 将访问端逻辑桌面坐标还原为物理桌面坐标。
+ *
+ * 智能缩放产生的黑边不对应物理像素，位于黑边内的输入会钳制到最近的桌面边缘；普通会话保持
+ * 原坐标不变。结果供所有 Windows 绝对鼠标事件共用。
+ */
+static void win_shadow_map_client_point(const rdpShadowClient* client, UINT16 x, UINT16 y,
+                                        POINT* physicalPoint)
+{
+	UINT32 localX;
+	UINT32 localY;
+
+	WINPR_ASSERT(client);
+	WINPR_ASSERT(physicalPoint);
+	physicalPoint->x = x;
+	physicalPoint->y = y;
+	if (!client->smartSizing || !client->sourceWidth || !client->sourceHeight ||
+	    !client->outputWidth || !client->outputHeight)
+		return;
+
+	localX = (x > client->outputOriginX) ? x - client->outputOriginX : 0;
+	localY = (y > client->outputOriginY) ? y - client->outputOriginY : 0;
+	localX = MIN(localX, client->outputWidth - 1U);
+	localY = MIN(localY, client->outputHeight - 1U);
+	physicalPoint->x =
+	    (LONG)(((UINT64)localX * (client->sourceWidth - 1U) + client->outputWidth / 2U) /
+	           MAX(client->outputWidth - 1U, 1U));
+	physicalPoint->y =
+	    (LONG)(((UINT64)localY * (client->sourceHeight - 1U) + client->outputHeight / 2U) /
+	           MAX(client->outputHeight - 1U, 1U));
+}
+
+/**
+ * 注入普通 RDP 鼠标事件。
+ *
+ * 坐标先经过智能缩放逆变换，再转换为 Windows 绝对坐标；滚轮与按键语义保持协议原样，失败时
+ * 返回 FALSE 使调用链准确报告输入注入错误。
+ */
 static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
                                          UINT16 flags, UINT16 x, UINT16 y)
 {
@@ -411,6 +449,7 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 	INPUT event = WINPR_C_ARRAY_INIT;
 	float width;
 	float height;
+	POINT physicalPoint = WINPR_C_ARRAY_INIT;
 
 	event.type = INPUT_MOUSE;
 
@@ -438,10 +477,11 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 	}
 	else
 	{
-		width = (float)GetSystemMetrics(SM_CXSCREEN);
-		height = (float)GetSystemMetrics(SM_CYSCREEN);
-		event.mi.dx = (LONG)((float)x * (65535.0f / width));
-		event.mi.dy = (LONG)((float)y * (65535.0f / height));
+		win_shadow_map_client_point(client, x, y, &physicalPoint);
+		width = (float)MAX(GetSystemMetrics(SM_CXSCREEN) - 1, 1);
+		height = (float)MAX(GetSystemMetrics(SM_CYSCREEN) - 1, 1);
+		event.mi.dx = (LONG)((float)physicalPoint.x * (65535.0f / width));
+		event.mi.dy = (LONG)((float)physicalPoint.y * (65535.0f / height));
 		event.mi.dwFlags = MOUSEEVENTF_ABSOLUTE;
 
 		if (flags & PTR_FLAGS_MOVE)
@@ -488,6 +528,11 @@ static BOOL win_shadow_input_mouse_event(rdpShadowSubsystem* subsystem, rdpShado
 	return TRUE;
 }
 
+/**
+ * 注入 RDP 扩展鼠标按键事件。
+ *
+ * 扩展按键与普通鼠标复用相同的智能缩放坐标映射，确保侧键点击位置和远程光标显示位置一致。
+ */
 static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
                                                   rdpShadowClient* client, UINT16 flags, UINT16 x,
                                                   UINT16 y)
@@ -496,6 +541,7 @@ static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
 	INPUT event = WINPR_C_ARRAY_INIT;
 	float width;
 	float height;
+	POINT physicalPoint = WINPR_C_ARRAY_INIT;
 
 	if ((flags & PTR_XFLAGS_BUTTON1) || (flags & PTR_XFLAGS_BUTTON2))
 	{
@@ -503,10 +549,11 @@ static BOOL win_shadow_input_extended_mouse_event(rdpShadowSubsystem* subsystem,
 
 		if (flags & PTR_FLAGS_MOVE)
 		{
-			width = (float)GetSystemMetrics(SM_CXSCREEN);
-			height = (float)GetSystemMetrics(SM_CYSCREEN);
-			event.mi.dx = (LONG)((float)x * (65535.0f / width));
-			event.mi.dy = (LONG)((float)y * (65535.0f / height));
+			win_shadow_map_client_point(client, x, y, &physicalPoint);
+			width = (float)MAX(GetSystemMetrics(SM_CXSCREEN) - 1, 1);
+			height = (float)MAX(GetSystemMetrics(SM_CYSCREEN) - 1, 1);
+			event.mi.dx = (LONG)((float)physicalPoint.x * (65535.0f / width));
+			event.mi.dy = (LONG)((float)physicalPoint.y * (65535.0f / height));
 			event.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
 			rc = SendInput(1, &event, sizeof(INPUT));
 			if (rc == 0)
@@ -844,6 +891,8 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	/* Windows 物理桌面尺寸固定；由 RDPGFX 在访问端输出区域内等比缩放，避免改变 DXGI 拓扑。 */
+	subsystem->base.server->SmartSizing = TRUE;
 	subsystem->base.numMonitors = win_shadow_enum_monitors(subsystem->base.monitors, 16);
 	if ((subsystem->base.numMonitors < 1) ||
 	    (subsystem->base.selectedMonitor >= subsystem->base.numMonitors))
@@ -882,7 +931,7 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 		return status;
 
 	if (!win_shadow_privacy_init(subsystem))
-		WLog_WARN(TAG, "本机隐私遮罩不可用，远程会话将保持稳定但不会自动黑屏");
+		WLog_WARN(TAG, "本机显示器亮度控制不可用，远程会话将保持稳定但不会自动熄屏");
 
 	subsystem->base.captureFrameRate = (subsystem->base.server->h264FrameRate <
 	                                    SHADOW_CAPTURE_INITIAL_FPS)
