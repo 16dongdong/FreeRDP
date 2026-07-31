@@ -297,16 +297,17 @@ static BOOL win_shadow_brightness_set(winShadowBrightnessController* controller,
 		goto out;
 
 	operation = "写入 WMI Timeout 参数";
-	value.vt = VT_UI4;
-	value.ulVal = 0;
-	status = input->lpVtbl->Put(input, L"Timeout", 0, &value, 0);
+	/* WMI 的 CIM_UINT32 通过 Automation 传输时使用 VT_I4，而不是 VT_UI4。 */
+	value.vt = VT_I4;
+	value.lVal = 0;
+	status = input->lpVtbl->Put(input, L"Timeout", 0, &value, CIM_UINT32);
 	if (FAILED(status))
 		goto out;
 
 	operation = "写入 WMI Brightness 参数";
 	value.vt = VT_UI1;
 	value.bVal = brightness;
-	status = input->lpVtbl->Put(input, L"Brightness", 0, &value, 0);
+	status = input->lpVtbl->Put(input, L"Brightness", 0, &value, CIM_UINT8);
 	if (FAILED(status))
 		goto out;
 
@@ -331,6 +332,30 @@ out:
 	if (methodClass)
 		methodClass->lpVtbl->Release(methodClass);
 	return success;
+}
+
+/**
+ * 以当前亮度写回当前亮度，验证驱动的 WmiSetBrightness 完整调用路径。
+ *
+ * 自检不会造成可见亮度变化；至少一个活动显示器验证成功才启用隐私控制，避免连接后才发现驱动
+ * 拒绝方法调用。失败步骤由底层设置函数记录精确 HRESULT。
+ */
+static BOOL win_shadow_brightness_validate(winShadowBrightnessController* controller)
+{
+	BOOL available = FALSE;
+
+	if (!controller)
+		return FALSE;
+
+	for (UINT32 index = 0; index < controller->count; index++)
+	{
+		const winShadowBrightnessDisplay* display = &controller->displays[index];
+		if (display->methodPath &&
+		    win_shadow_brightness_set(controller, display->methodPath, display->originalBrightness))
+			available = TRUE;
+	}
+
+	return available;
 }
 
 /**
@@ -380,7 +405,8 @@ winShadowBrightnessController* win_shadow_brightness_new(void)
 	                           nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr,
 	                           EOAC_NONE);
 	if (FAILED(status) || !win_shadow_brightness_collect_levels(controller) ||
-	    !win_shadow_brightness_collect_methods(controller))
+	    !win_shadow_brightness_collect_methods(controller) ||
+	    !win_shadow_brightness_validate(controller))
 		goto fail;
 
 	WLog_INFO(TAG, "已启用 %" PRIu32 " 个本机显示器的亮度隐私控制", controller->count);
