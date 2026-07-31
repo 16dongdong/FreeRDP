@@ -27,6 +27,7 @@
 #include <freerdp/codec/region.h>
 #include <freerdp/server/server-common.h>
 
+#include "win_brightness.h"
 #include "win_shadow.h"
 
 #define TAG SERVER_TAG("shadow.win")
@@ -37,10 +38,6 @@
 #define WM_SHADOW_PRIVACY_HIDE (WM_APP + 0x202)
 #define WM_SHADOW_PRIVACY_STOP (WM_APP + 0x203)
 
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
-
 /* https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mouse_event
  * does not mention this flag is only supported if building for _WIN32_WINNT >= 0x0600
  */
@@ -49,65 +46,53 @@
 #endif
 
 /**
- * 绘制本机隐私遮罩。
+ * 调暗本机物理显示器以保护隐私。
  *
- * 物理 DPMS 息屏会重置 DXGI Desktop Duplication，从而导致远程画面冻结、残影或重叠。遮罩
- * 仅在本机显示黑色画面，并通过 WDA_EXCLUDEFROMCAPTURE 排除在远程捕获外，保留原始桌面的
- * 连续帧序列。
+ * 黑色遮罩会被部分 DXGI Desktop Duplication 实现捕获并送至远程端，造成黑底、残影和叠帧。
+ * 亮度控制不改变桌面像素和捕获拓扑，因此保留连续的远程帧序列。
  */
 static void win_shadow_privacy_show(HWND window)
 {
-	const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-	const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-	const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-	const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+	winShadowBrightnessController* brightness = nullptr;
 
-	if (!window || (width < 1) || (height < 1))
+	if (!window)
 		return;
 
-	SetWindowPos(window, HWND_TOPMOST, left, top, width, height,
-	             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
-	InvalidateRect(window, nullptr, TRUE);
+	brightness = (winShadowBrightnessController*)GetWindowLongPtrW(window, GWLP_USERDATA);
+	if (!brightness || !win_shadow_brightness_dim(brightness))
+		WLog_WARN(TAG, "调暗本机显示器亮度失败");
 }
 
 /**
- * 隐藏本机隐私遮罩。
+ * 恢复本机物理显示器亮度。
  *
  * 此操作只由已验证为非注入的本机键鼠输入触发；远程端通过 SendInput 注入的输入不会进入该
  * 路径，因此不会意外点亮本机屏幕。
  */
 static void win_shadow_privacy_hide(HWND window)
 {
+	winShadowBrightnessController* brightness = nullptr;
+
 	if (!window)
 		return;
 
 	KillTimer(window, SHADOW_PRIVACY_TIMER_ID);
-	ShowWindow(window, SW_HIDE);
+	brightness = (winShadowBrightnessController*)GetWindowLongPtrW(window, GWLP_USERDATA);
+	if (brightness && !win_shadow_brightness_restore(brightness))
+		WLog_WARN(TAG, "恢复本机显示器亮度失败");
 }
 
 /**
- * 处理隐私遮罩窗口的绘制与延迟显示。
+ * 处理隐私控制窗口的延迟调暗。
  *
- * 窗口永不激活且命中测试透明，物理键鼠可继续操作桌面；定时器只在 RDP 图形会话就绪后显示
- * 遮罩，避免连接握手期间改变桌面显示状态。
+ * 此消息窗口不参与可见桌面，定时器只在 RDP 图形会话就绪后调暗显示器，避免连接握手期间
+ * 改变本机显示状态。
  */
 static LRESULT CALLBACK win_shadow_privacy_window_proc(HWND window, UINT message, WPARAM wParam,
                                                         LPARAM lParam)
 {
 	switch (message)
 	{
-		case WM_ERASEBKGND:
-			return 1;
-		case WM_NCHITTEST:
-			return HTTRANSPARENT;
-		case WM_PAINT:
-		{
-			PAINTSTRUCT paint = WINPR_C_ARRAY_INIT;
-			HDC deviceContext = BeginPaint(window, &paint);
-			FillRect(deviceContext, &paint.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
-			EndPaint(window, &paint);
-			return 0;
-		}
 		case WM_TIMER:
 			if (wParam == SHADOW_PRIVACY_TIMER_ID)
 			{
@@ -121,10 +106,10 @@ static LRESULT CALLBACK win_shadow_privacy_window_proc(HWND window, UINT message
 }
 
 /**
- * 创建不会进入 DXGI 捕获流的黑色隐私窗口。
+ * 创建只承载亮度控制状态的消息窗口。
  *
- * WDA_EXCLUDEFROMCAPTURE 不可用时返回 nullptr，而不是显示会污染远程画面的黑窗。调用方保留
- * 正常桌面共享，避免以本机隐私功能换取远程渲染正确性。
+ * 窗口为 HWND_MESSAGE，不会绘制到本机桌面，也不会进入 DXGI 捕获流；不再依赖各显卡实现
+ * 不一致的 WDA_EXCLUDEFROMCAPTURE。
  */
 static HWND win_shadow_privacy_create_window(void)
 {
@@ -142,8 +127,7 @@ static HWND win_shadow_privacy_create_window(void)
 		return nullptr;
 	}
 
-	window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-	                         windowClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+	window = CreateWindowExW(0, windowClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr,
 	                         windowClass.hInstance, nullptr);
 	if (!window)
 	{
@@ -151,18 +135,11 @@ static HWND win_shadow_privacy_create_window(void)
 		return nullptr;
 	}
 
-	if (!SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE))
-	{
-		WLog_WARN(TAG, "无法将本机隐私遮罩排除在捕获外: %lu", GetLastError());
-		DestroyWindow(window);
-		return nullptr;
-	}
-
 	return window;
 }
 
 /**
- * 识别真实本机键盘输入并请求撤销隐私遮罩。
+ * 识别真实本机键盘输入并请求恢复显示器亮度。
  *
  * Windows 将 SendInput 标记为注入事件。只响应没有 LLKHF_INJECTED 标记的事件，可让远程键盘
  * 控制继续工作而不点亮本机画面。
@@ -180,10 +157,10 @@ static LRESULT CALLBACK win_shadow_privacy_keyboard_hook(int code, WPARAM wParam
 }
 
 /**
- * 识别真实本机鼠标输入并请求撤销隐私遮罩。
+ * 识别真实本机鼠标输入并请求恢复显示器亮度。
  *
- * 与键盘钩子相同，LLMHF_INJECTED 的远程输入不会移除遮罩；用户触碰物理鼠标后遮罩立即隐藏，
- * 且不会在当前会话内再次自动显示。
+ * 与键盘钩子相同，LLMHF_INJECTED 的远程输入不会恢复亮度；用户触碰物理鼠标后立即恢复亮度，
+ * 且不会在当前会话内再次自动调暗。
  */
 static LRESULT CALLBACK win_shadow_privacy_mouse_hook(int code, WPARAM wParam, LPARAM lParam)
 {
@@ -198,7 +175,7 @@ static LRESULT CALLBACK win_shadow_privacy_mouse_hook(int code, WPARAM wParam, L
 }
 
 /**
- * 运行本机隐私遮罩与物理输入钩子的消息循环。
+ * 运行本机亮度隐私控制与物理输入钩子的消息循环。
  *
  * 线程只持有子系统中由停止路径等待释放的状态。启动完成后通知初始化者；窗口、钩子或消息循环
  * 创建失败时退出，服务本身仍可继续提供远程桌面。
@@ -209,13 +186,23 @@ static DWORD WINAPI win_shadow_privacy_thread(LPVOID arg)
 	MSG message = WINPR_C_ARRAY_INIT;
 	HHOOK keyboardHook = nullptr;
 	HHOOK mouseHook = nullptr;
+	winShadowBrightnessController* brightness = nullptr;
 	BOOL running = TRUE;
 
 	WINPR_ASSERT(subsystem);
 	PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+	brightness = win_shadow_brightness_new();
+	if (!brightness)
+	{
+		WLog_WARN(TAG, "本机显示器亮度控制不可用");
+		SetEvent(subsystem->privacyReadyEvent);
+		return 0;
+	}
+
 	subsystem->privacyWindow = win_shadow_privacy_create_window();
 	if (subsystem->privacyWindow)
 	{
+		SetWindowLongPtrW(subsystem->privacyWindow, GWLP_USERDATA, (LONG_PTR)brightness);
 		keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, win_shadow_privacy_keyboard_hook,
 		                                GetModuleHandleW(nullptr), 0);
 		mouseHook = SetWindowsHookExW(WH_MOUSE_LL, win_shadow_privacy_mouse_hook,
@@ -233,6 +220,9 @@ static DWORD WINAPI win_shadow_privacy_thread(LPVOID arg)
 	}
 
 	SetEvent(subsystem->privacyReadyEvent);
+	if (!subsystem->privacyWindow)
+		goto out;
+
 	while (running && GetMessageW(&message, nullptr, 0, 0) > 0)
 	{
 		if (message.hwnd == nullptr)
@@ -260,6 +250,7 @@ static DWORD WINAPI win_shadow_privacy_thread(LPVOID arg)
 		DispatchMessageW(&message);
 	}
 
+out:
 	if (keyboardHook)
 		UnhookWindowsHookEx(keyboardHook);
 	if (mouseHook)
@@ -267,11 +258,12 @@ static DWORD WINAPI win_shadow_privacy_thread(LPVOID arg)
 	if (subsystem->privacyWindow)
 		DestroyWindow(subsystem->privacyWindow);
 	subsystem->privacyWindow = nullptr;
+	win_shadow_brightness_free(brightness);
 	return 0;
 }
 
 /**
- * 初始化本机隐私遮罩线程。
+ * 初始化本机亮度隐私控制线程。
  *
  * 此线程在服务启动时预热，连接阶段只投递异步消息，不会让 RDP 握手等待窗口或钩子创建。失败
  * 时返回 FALSE，由调用方记录告警并继续提供无息屏的稳定远程服务。
@@ -303,7 +295,7 @@ static BOOL win_shadow_privacy_init(winShadowSubsystem* subsystem)
 }
 
 /**
- * 停止本机隐私遮罩线程并释放其同步句柄。
+ * 停止本机亮度隐私控制线程并释放其同步句柄。
  *
  * 停止消息在消息队列已就绪后发送；等待线程退出可确保子系统释放后没有输入钩子继续访问其状态。
  */
@@ -329,10 +321,10 @@ static void win_shadow_privacy_uninit(winShadowSubsystem* subsystem)
 }
 
 /**
- * 在 RDP 图形会话激活后安排本机隐私黑屏。
+ * 在 RDP 图形会话激活后安排本机显示器调暗。
  *
- * 该调用只向已就绪的遮罩线程投递消息，绝不阻塞图形握手；客户端断开不会撤销遮罩，只有本机
- * 物理键鼠钩子会隐藏它。
+ * 该调用只向已就绪的控制线程投递消息，绝不阻塞图形握手；客户端断开不会恢复亮度，只有本机
+ * 物理键鼠钩子会恢复它。
  */
 static void win_shadow_client_activated(rdpShadowSubsystem* arg, rdpShadowClient* client)
 {
