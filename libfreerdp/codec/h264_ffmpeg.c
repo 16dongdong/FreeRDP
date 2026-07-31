@@ -428,8 +428,8 @@ static int set_hw_frames_ctx(H264_CONTEXT* WINPR_RESTRICT h264)
 /**
  * 创建用于实时桌面画面的 FFmpeg H.264 编码上下文。
  *
- * Shadow 需要优先交付最新帧而非以高 CPU 成本压缩旧帧，因此软件编码采用 faster 与 zerolatency
- * 组合；在服务端提高目标码率后，这比 medium 能显著降低 1080p 动态桌面的编码延迟。分配、
+ * Shadow 需要优先交付最新帧而非以高 CPU 成本压缩旧帧，因此软件编码采用 veryfast 与 zerolatency
+ * 组合；配合稳定的 30 fps 与 12 Mbps 上限，可避免 1080p 动态桌面因编码积帧而输入滞后。分配、
  * 参数设置或打开编码器失败时返回 FALSE，调用方中止当前帧而不会发送不完整码流。
  */
 static BOOL libavcodec_create_encoder_context(H264_CONTEXT* WINPR_RESTRICT h264)
@@ -510,7 +510,7 @@ static BOOL libavcodec_create_encoder_context(H264_CONTEXT* WINPR_RESTRICT h264)
 	else
 #endif
 	{
-		av_opt_set(sys->codecEncoderContext, "preset", "faster", AV_OPT_SEARCH_CHILDREN);
+		av_opt_set(sys->codecEncoderContext, "preset", "veryfast", AV_OPT_SEARCH_CHILDREN);
 		sys->codecEncoderContext->pix_fmt = AV_PIX_FMT_YUV420P;
 	}
 

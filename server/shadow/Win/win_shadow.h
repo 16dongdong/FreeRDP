@@ -48,6 +48,10 @@ struct win_shadow_subsystem
 	int height;
 	HANDLE audioThread;
 	HANDLE audioStopEvent;
+	HANDLE privacyThread;
+	HANDLE privacyReadyEvent;
+	DWORD privacyThreadId;
+	HWND privacyWindow;
 
 #ifdef WITH_WDS_API
 	HWND hWnd;

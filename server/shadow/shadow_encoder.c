@@ -27,16 +27,17 @@
 #include <freerdp/log.h>
 #define TAG CLIENT_TAG("shadow")
 
-/* 两帧以内是 RDPGFX 正常的传输流水线，不应据此降低交互桌面的帧率。 */
-#define SHADOW_ENCODER_TARGET_QUEUE_DEPTH 2U
-#define SHADOW_ENCODER_INTERACTIVE_START_FPS 30U
-#define SHADOW_ENCODER_FPS_RAMP_STEP 4U
+/* 软件 H.264 只保留一个在途帧，优先交付最新桌面状态而不是积压旧画面。 */
+#define SHADOW_ENCODER_TARGET_QUEUE_DEPTH 1U
+#define SHADOW_ENCODER_INTERACTIVE_START_FPS 20U
+#define SHADOW_ENCODER_FPS_RAMP_STEP 2U
 
 /**
  * 计算交互式物理桌面共享的初始编码帧率。
  *
- * 新客户端刚建立时尚无帧确认，使用 30 fps 起步可避免旧实现从 16 fps 缓慢爬升造成的首段卡顿；
- * maxFps 是经过命令行校验的服务上限。无效的零上限保持为零，由调用方按既有失败语义处理。
+ * 新客户端刚建立时尚无帧确认，使用 20 fps 起步可快速显示桌面而不让软件编码器在首个关键帧
+ * 阶段积压；maxFps 是经过命令行校验的服务上限。无效的零上限保持为零，由调用方按既有失败
+ * 语义处理。
  */
 static UINT32 shadow_encoder_initial_fps(UINT32 maxFps)
 {
@@ -75,9 +76,9 @@ UINT32 shadow_encoder_inflight_frames(rdpShadowEncoder* encoder)
 /**
  * 分配下一帧标识并按客户端队列反馈调节编码速度。
  *
- * 正常的两帧流水线内以每帧 4 fps 的速度快速升至 maxFps；超过该阈值时按队列深度平滑回退，
- * 既避免网络抖动时堆积旧画面，也不会像旧实现一样因两帧确认延迟突然降到三分之一帧率。返回值
- * 为单调递增的 RDP 帧标识，编码器状态无效时的零帧率仍由下游保护为 1 fps。
+ * 仅有一个在途帧时逐步升至 maxFps；超过一个时立即按队列深度降低采集速率。这个保守策略
+ * 防止软件 H.264 与网络回执不同步时继续发送旧帧，避免鼠标跟手滞后和局部画面重叠。返回值为
+ * 单调递增的 RDP 帧标识，编码器状态无效时的零帧率仍由下游保护为 1 fps。
  */
 UINT32 shadow_encoder_create_frame_id(rdpShadowEncoder* encoder)
 {
@@ -87,9 +88,7 @@ UINT32 shadow_encoder_create_frame_id(rdpShadowEncoder* encoder)
 	if (inFlightFrames > SHADOW_ENCODER_TARGET_QUEUE_DEPTH)
 	{
 		const UINT32 denominator = inFlightFrames + 1;
-		encoder->fps = (denominator == 0)
-		                   ? 1
-		                   : (encoder->maxFps * SHADOW_ENCODER_TARGET_QUEUE_DEPTH) / denominator;
+		encoder->fps = (denominator == 0) ? 1 : encoder->maxFps / denominator;
 	}
 	else if (encoder->fps < encoder->maxFps)
 	{

@@ -30,8 +30,16 @@
 #include "win_shadow.h"
 
 #define TAG SERVER_TAG("shadow.win")
-#define SHADOW_CAPTURE_INITIAL_FPS 30U
-#define SHADOW_DISPLAY_BLANK_DELAY_MS 1500U
+#define SHADOW_CAPTURE_INITIAL_FPS 20U
+#define SHADOW_PRIVACY_BLACKOUT_DELAY_MS 1500U
+#define SHADOW_PRIVACY_TIMER_ID 1U
+#define WM_SHADOW_PRIVACY_SCHEDULE (WM_APP + 0x201)
+#define WM_SHADOW_PRIVACY_HIDE (WM_APP + 0x202)
+#define WM_SHADOW_PRIVACY_STOP (WM_APP + 0x203)
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
 
 /* https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mouse_event
  * does not mention this flag is only supported if building for _WIN32_WINNT >= 0x0600
@@ -40,64 +48,322 @@
 #define MOUSEEVENTF_HWHEEL 0x1000
 #endif
 
-static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
-                                               rdpShadowClient* client, UINT32 flags)
+/**
+ * 绘制本机隐私遮罩。
+ *
+ * 物理 DPMS 息屏会重置 DXGI Desktop Duplication，从而导致远程画面冻结、残影或重叠。遮罩
+ * 仅在本机显示黑色画面，并通过 WDA_EXCLUDEFROMCAPTURE 排除在远程捕获外，保留原始桌面的
+ * 连续帧序列。
+ */
+static void win_shadow_privacy_show(HWND window)
 {
-	WLog_WARN(TAG, "TODO: Implement!");
-	return TRUE;
+	const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+	const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+	const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+	const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+	if (!window || (width < 1) || (height < 1))
+		return;
+
+	SetWindowPos(window, HWND_TOPMOST, left, top, width, height,
+	             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+	InvalidateRect(window, nullptr, TRUE);
 }
 
 /**
- * 关闭当前交互桌面的物理显示器。
+ * 隐藏本机隐私遮罩。
  *
- * 仅发送关闭命令，不会在远程会话断开时重新点亮屏幕；Windows 的原生物理键鼠活动仍可唤醒
- * 显示器。广播带有超时，任一窗口无响应时不会阻塞 RDP 协议线程。
+ * 此操作只由已验证为非注入的本机键鼠输入触发；远程端通过 SendInput 注入的输入不会进入该
+ * 路径，因此不会意外点亮本机屏幕。
  */
-static void win_shadow_blank_local_display(void)
+static void win_shadow_privacy_hide(HWND window)
 {
-	DWORD_PTR messageResult = 0;
-	const LRESULT delivered = SendMessageTimeout(
-	    HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2, SMTO_ABORTIFHUNG, 1000,
-	    &messageResult);
+	if (!window)
+		return;
 
-	if (delivered == 0)
-		WLog_WARN(TAG, "关闭本地显示器失败: %lu", GetLastError());
+	KillTimer(window, SHADOW_PRIVACY_TIMER_ID);
+	ShowWindow(window, SW_HIDE);
 }
 
 /**
- * 在首帧有机会送达后异步执行息屏。
+ * 处理隐私遮罩窗口的绘制与延迟显示。
  *
- * 此线程不持有客户端或子系统指针，因此服务在延迟窗口内停止时也不会访问已释放内存。延迟将
- * DXGI 显示状态切换从 RDP 激活路径移开，避免客户端长时间停留在“正在配置远程主机”。
+ * 窗口永不激活且命中测试透明，物理键鼠可继续操作桌面；定时器只在 RDP 图形会话就绪后显示
+ * 遮罩，避免连接握手期间改变桌面显示状态。
  */
-static DWORD WINAPI win_shadow_deferred_display_blank_thread(void* arg)
+static LRESULT CALLBACK win_shadow_privacy_window_proc(HWND window, UINT message, WPARAM wParam,
+                                                        LPARAM lParam)
 {
-	WINPR_UNUSED(arg);
-	Sleep(SHADOW_DISPLAY_BLANK_DELAY_MS);
-	win_shadow_blank_local_display();
+	switch (message)
+	{
+		case WM_ERASEBKGND:
+			return 1;
+		case WM_NCHITTEST:
+			return HTTRANSPARENT;
+		case WM_PAINT:
+		{
+			PAINTSTRUCT paint = WINPR_C_ARRAY_INIT;
+			HDC deviceContext = BeginPaint(window, &paint);
+			FillRect(deviceContext, &paint.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			EndPaint(window, &paint);
+			return 0;
+		}
+		case WM_TIMER:
+			if (wParam == SHADOW_PRIVACY_TIMER_ID)
+			{
+				KillTimer(window, SHADOW_PRIVACY_TIMER_ID);
+				win_shadow_privacy_show(window);
+			}
+			return 0;
+		default:
+			return DefWindowProc(window, message, wParam, lParam);
+	}
+}
+
+/**
+ * 创建不会进入 DXGI 捕获流的黑色隐私窗口。
+ *
+ * WDA_EXCLUDEFROMCAPTURE 不可用时返回 nullptr，而不是显示会污染远程画面的黑窗。调用方保留
+ * 正常桌面共享，避免以本机隐私功能换取远程渲染正确性。
+ */
+static HWND win_shadow_privacy_create_window(void)
+{
+	static const WCHAR windowClassName[] = L"FreeRDPShadowPrivacyWindow";
+	WNDCLASSEXW windowClass = WINPR_C_ARRAY_INIT;
+	HWND window;
+
+	windowClass.cbSize = sizeof(windowClass);
+	windowClass.lpfnWndProc = win_shadow_privacy_window_proc;
+	windowClass.hInstance = GetModuleHandleW(nullptr);
+	windowClass.lpszClassName = windowClassName;
+	if (!RegisterClassExW(&windowClass) && (GetLastError() != ERROR_CLASS_ALREADY_EXISTS))
+	{
+		WLog_WARN(TAG, "注册本机隐私遮罩窗口失败: %lu", GetLastError());
+		return nullptr;
+	}
+
+	window = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+	                         windowClassName, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr,
+	                         windowClass.hInstance, nullptr);
+	if (!window)
+	{
+		WLog_WARN(TAG, "创建本机隐私遮罩窗口失败: %lu", GetLastError());
+		return nullptr;
+	}
+
+	if (!SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE))
+	{
+		WLog_WARN(TAG, "无法将本机隐私遮罩排除在捕获外: %lu", GetLastError());
+		DestroyWindow(window);
+		return nullptr;
+	}
+
+	return window;
+}
+
+/**
+ * 识别真实本机键盘输入并请求撤销隐私遮罩。
+ *
+ * Windows 将 SendInput 标记为注入事件。只响应没有 LLKHF_INJECTED 标记的事件，可让远程键盘
+ * 控制继续工作而不点亮本机画面。
+ */
+static LRESULT CALLBACK win_shadow_privacy_keyboard_hook(int code, WPARAM wParam, LPARAM lParam)
+{
+	if ((code == HC_ACTION) && lParam)
+	{
+		const KBDLLHOOKSTRUCT* input = (const KBDLLHOOKSTRUCT*)lParam;
+		if ((input->flags & LLKHF_INJECTED) == 0)
+			PostThreadMessage(GetCurrentThreadId(), WM_SHADOW_PRIVACY_HIDE, 0, 0);
+	}
+
+	return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+/**
+ * 识别真实本机鼠标输入并请求撤销隐私遮罩。
+ *
+ * 与键盘钩子相同，LLMHF_INJECTED 的远程输入不会移除遮罩；用户触碰物理鼠标后遮罩立即隐藏，
+ * 且不会在当前会话内再次自动显示。
+ */
+static LRESULT CALLBACK win_shadow_privacy_mouse_hook(int code, WPARAM wParam, LPARAM lParam)
+{
+	if ((code == HC_ACTION) && lParam)
+	{
+		const MSLLHOOKSTRUCT* input = (const MSLLHOOKSTRUCT*)lParam;
+		if ((input->flags & LLMHF_INJECTED) == 0)
+			PostThreadMessage(GetCurrentThreadId(), WM_SHADOW_PRIVACY_HIDE, 0, 0);
+	}
+
+	return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+/**
+ * 运行本机隐私遮罩与物理输入钩子的消息循环。
+ *
+ * 线程只持有子系统中由停止路径等待释放的状态。启动完成后通知初始化者；窗口、钩子或消息循环
+ * 创建失败时退出，服务本身仍可继续提供远程桌面。
+ */
+static DWORD WINAPI win_shadow_privacy_thread(LPVOID arg)
+{
+	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
+	MSG message = WINPR_C_ARRAY_INIT;
+	HHOOK keyboardHook = nullptr;
+	HHOOK mouseHook = nullptr;
+	BOOL running = TRUE;
+
+	WINPR_ASSERT(subsystem);
+	PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+	subsystem->privacyWindow = win_shadow_privacy_create_window();
+	if (subsystem->privacyWindow)
+	{
+		keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, win_shadow_privacy_keyboard_hook,
+		                                GetModuleHandleW(nullptr), 0);
+		mouseHook = SetWindowsHookExW(WH_MOUSE_LL, win_shadow_privacy_mouse_hook,
+		                             GetModuleHandleW(nullptr), 0);
+		if (!keyboardHook || !mouseHook)
+		{
+			WLog_WARN(TAG, "安装本机隐私遮罩输入钩子失败: %lu", GetLastError());
+			if (keyboardHook)
+				UnhookWindowsHookEx(keyboardHook);
+			if (mouseHook)
+				UnhookWindowsHookEx(mouseHook);
+			DestroyWindow(subsystem->privacyWindow);
+			subsystem->privacyWindow = nullptr;
+		}
+	}
+
+	SetEvent(subsystem->privacyReadyEvent);
+	while (running && GetMessageW(&message, nullptr, 0, 0) > 0)
+	{
+		if (message.hwnd == nullptr)
+		{
+			switch (message.message)
+			{
+				case WM_SHADOW_PRIVACY_SCHEDULE:
+					if (subsystem->privacyWindow &&
+					    !SetTimer(subsystem->privacyWindow, SHADOW_PRIVACY_TIMER_ID,
+					              SHADOW_PRIVACY_BLACKOUT_DELAY_MS, nullptr))
+						WLog_WARN(TAG, "安排本机隐私遮罩失败: %lu", GetLastError());
+					continue;
+				case WM_SHADOW_PRIVACY_HIDE:
+					win_shadow_privacy_hide(subsystem->privacyWindow);
+					continue;
+				case WM_SHADOW_PRIVACY_STOP:
+					running = FALSE;
+					continue;
+				default:
+					break;
+			}
+		}
+
+		TranslateMessage(&message);
+		DispatchMessageW(&message);
+	}
+
+	if (keyboardHook)
+		UnhookWindowsHookEx(keyboardHook);
+	if (mouseHook)
+		UnhookWindowsHookEx(mouseHook);
+	if (subsystem->privacyWindow)
+		DestroyWindow(subsystem->privacyWindow);
+	subsystem->privacyWindow = nullptr;
 	return 0;
 }
 
 /**
- * 在 RDP 图形会话激活后安排本地息屏。
+ * 初始化本机隐私遮罩线程。
  *
- * 创建的线程立即脱离调用方，故不会阻塞握手；线程创建失败只记录告警，远程会话仍可正常使用。
+ * 此线程在服务启动时预热，连接阶段只投递异步消息，不会让 RDP 握手等待窗口或钩子创建。失败
+ * 时返回 FALSE，由调用方记录告警并继续提供无息屏的稳定远程服务。
  */
-static void win_shadow_client_activated(rdpShadowSubsystem* subsystem, rdpShadowClient* client)
+static BOOL win_shadow_privacy_init(winShadowSubsystem* subsystem)
 {
-	HANDLE blankThread =
-	    CreateThread(nullptr, 0, win_shadow_deferred_display_blank_thread, nullptr, 0, nullptr);
+	DWORD waitResult;
 
-	WINPR_UNUSED(subsystem);
-	WINPR_UNUSED(client);
+	WINPR_ASSERT(subsystem);
+	subsystem->privacyReadyEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+	if (!subsystem->privacyReadyEvent)
+		return FALSE;
 
-	if (!blankThread)
+	subsystem->privacyThread = CreateThread(nullptr, 0, win_shadow_privacy_thread, subsystem, 0,
+	                                        &subsystem->privacyThreadId);
+	if (!subsystem->privacyThread)
 	{
-		WLog_WARN(TAG, "创建延后息屏线程失败: %lu", GetLastError());
+		CloseHandle(subsystem->privacyReadyEvent);
+		subsystem->privacyReadyEvent = nullptr;
+		return FALSE;
+	}
+
+	waitResult = WaitForSingleObject(subsystem->privacyReadyEvent, 3000);
+	if ((waitResult == WAIT_OBJECT_0) && subsystem->privacyWindow)
+		return TRUE;
+
+	WLog_WARN(TAG, "本机隐私遮罩未能就绪: %lu", waitResult);
+	return FALSE;
+}
+
+/**
+ * 停止本机隐私遮罩线程并释放其同步句柄。
+ *
+ * 停止消息在消息队列已就绪后发送；等待线程退出可确保子系统释放后没有输入钩子继续访问其状态。
+ */
+static void win_shadow_privacy_uninit(winShadowSubsystem* subsystem)
+{
+	WINPR_ASSERT(subsystem);
+	if (subsystem->privacyThread)
+	{
+		if (subsystem->privacyThreadId)
+			PostThreadMessage(subsystem->privacyThreadId, WM_SHADOW_PRIVACY_STOP, 0, 0);
+		WaitForSingleObject(subsystem->privacyThread, INFINITE);
+		CloseHandle(subsystem->privacyThread);
+		subsystem->privacyThread = nullptr;
+	}
+
+	if (subsystem->privacyReadyEvent)
+	{
+		CloseHandle(subsystem->privacyReadyEvent);
+		subsystem->privacyReadyEvent = nullptr;
+	}
+	subsystem->privacyThreadId = 0;
+	subsystem->privacyWindow = nullptr;
+}
+
+/**
+ * 在 RDP 图形会话激活后安排本机隐私黑屏。
+ *
+ * 该调用只向已就绪的遮罩线程投递消息，绝不阻塞图形握手；客户端断开不会撤销遮罩，只有本机
+ * 物理键鼠钩子会隐藏它。
+ */
+static void win_shadow_client_activated(rdpShadowSubsystem* arg, rdpShadowClient* client)
+{
+	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
+
+	WINPR_UNUSED(client);
+	WINPR_ASSERT(subsystem);
+
+	if (!subsystem->privacyWindow || !subsystem->privacyThreadId)
+	{
+		WLog_WARN(TAG, "本机隐私遮罩不可用，未改变显示状态");
 		return;
 	}
 
-	CloseHandle(blankThread);
+	if (!PostThreadMessage(subsystem->privacyThreadId, WM_SHADOW_PRIVACY_SCHEDULE, 0, 0))
+		WLog_WARN(TAG, "安排本机隐私遮罩失败: %lu", GetLastError());
+}
+
+/**
+ * 同步远程输入状态。
+ *
+ * Windows Shadow 当前不维护独立的锁键状态，此处保留协议成功语义；本机隐私遮罩通过低级钩子
+ * 区分注入输入，不会被该同步事件点亮。
+ */
+static BOOL win_shadow_input_synchronize_event(rdpShadowSubsystem* subsystem,
+                                               rdpShadowClient* client, UINT32 flags)
+{
+	WINPR_UNUSED(subsystem);
+	WINPR_UNUSED(client);
+	WINPR_UNUSED(flags);
+	return TRUE;
 }
 
 static BOOL win_shadow_input_keyboard_event(rdpShadowSubsystem* subsystem, rdpShadowClient* client,
@@ -623,6 +889,9 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	if (status < 0)
 		return status;
 
+	if (!win_shadow_privacy_init(subsystem))
+		WLog_WARN(TAG, "本机隐私遮罩不可用，远程会话将保持稳定但不会自动黑屏");
+
 	subsystem->base.captureFrameRate = (subsystem->base.server->h264FrameRate <
 	                                    SHADOW_CAPTURE_INITIAL_FPS)
 	                                       ? subsystem->base.server->h264FrameRate
@@ -647,6 +916,7 @@ static int win_shadow_subsystem_uninit(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	win_shadow_privacy_uninit(subsystem);
 	win_shadow_audio_uninit(subsystem);
 #if defined(WITH_WDS_API)
 	win_shadow_wds_uninit(subsystem);
