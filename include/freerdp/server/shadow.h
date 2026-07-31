@@ -162,6 +162,7 @@ extern "C"
 		DWORD port;
 		BOOL mayView;
 		BOOL mayInteract;
+		BOOL systemAudio;
 		BOOL shareSubRect;
 		BOOL authentication;
 		UINT32 selectedMonitor;

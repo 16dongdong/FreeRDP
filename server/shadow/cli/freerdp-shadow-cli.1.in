@@ -11,6 +11,8 @@
 [\fB/ipc-socket:\fP\fI<ipc-socket>\fP]
 [\fB/monitors:\fP\fI<0,1,2,...>\fP]
 [\fB/rect:\fP\fI<x,y,w,h>\fP]
+[\fB/max-fps:\fP\fI<1-60>\fP]
+[\fB+system-audio\fP]
 [\fB+auth\fP]
 [\fB-may-view\fP]
 [\fB-may-interact\fP]
@@ -37,6 +39,12 @@ This option is ignored if ipc-socket is used.
 Select the monitor(s) to share.
 .IP /rect:<x,y,w,h>      
 Select rectangle within monitor to share.
+.IP /max-fps:<1-60>
+设置物理桌面捕获和视频编码的最高帧率。服务会根据客户端确认进度自动降帧，避免网络积压。
+.IP -system-audio
+Disable Windows system-audio loopback capture (default:on). Captured audio is sent through the
+standard RDP sound channel and is unavailable only when Windows has no usable default playback
+device.
 .IP -auth
 Disable authentication. If authentication is enabled PAM is used with the
 X11 subsystem. Running as root is not necessary, however if run as user only

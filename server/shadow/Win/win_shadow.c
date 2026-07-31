@@ -535,7 +535,8 @@ static UINT32 win_shadow_enum_monitors(MONITOR_DEF* monitors, UINT32 maxMonitors
  * 初始化 Windows Shadow 的显示器描述和桌面复制后端。
  *
  * 函数在服务监听前运行。DXGI/WDS 初始化失败必须原样返回，避免旧实现继续使用未初始化的
- * 设备对象；成功后建立与编码器一致的初始低帧率捕获策略，等待客户端帧确认后再提升。
+ * 设备对象；成功后建立与编码器一致的初始低帧率捕获策略，等待客户端帧确认后再提升，并按
+ * 配置预备独立的 WASAPI 系统声音回环。声音后端不可用只会降级声音，不得影响物理桌面视频。
  */
 static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 {
@@ -553,6 +554,9 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 
 	subsystem->base.captureFrameRate =
 	    (subsystem->base.server->h264FrameRate < 16) ? subsystem->base.server->h264FrameRate : 16;
+	status = win_shadow_audio_init(subsystem);
+	if (status < 0)
+		WLog_WARN(TAG, "系统声音初始化失败，继续仅视频会话");
 	virtualScreen = &(subsystem->base.virtualScreen);
 	virtualScreen->left = 0;
 	virtualScreen->top = 0;
@@ -563,6 +567,12 @@ static int win_shadow_subsystem_init(rdpShadowSubsystem* arg)
 	return 1;
 }
 
+/**
+ * 停止 Windows Shadow 的系统声音并释放捕获后端。
+ *
+ * 音频线程先于 DXGI/WDS 资源停止，避免异步 RDPSND 消息在桌面后端或客户端队列销毁后仍访问
+ * 子系统。视频后端卸载失败会保留其原有返回语义；音频不可用始终不影响视频服务关闭。
+ */
 static int win_shadow_subsystem_uninit(rdpShadowSubsystem* arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
@@ -570,6 +580,7 @@ static int win_shadow_subsystem_uninit(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	win_shadow_audio_uninit(subsystem);
 #if defined(WITH_WDS_API)
 	win_shadow_wds_uninit(subsystem);
 #elif defined(WITH_DXGI_1_2)
@@ -578,6 +589,12 @@ static int win_shadow_subsystem_uninit(rdpShadowSubsystem* arg)
 	return 1;
 }
 
+/**
+ * 启动 Windows Shadow 的视频捕获与可选系统声音回环。
+ *
+ * 视频线程创建失败时返回负数，因为没有画面无法建立会话；音频线程仅是增强能力，失败时记录
+ * 警告后继续提供画面和控制，防止无播放设备的机器被整体拒绝服务。
+ */
 static int win_shadow_subsystem_start(rdpShadowSubsystem* arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
@@ -593,9 +610,18 @@ static int win_shadow_subsystem_start(rdpShadowSubsystem* arg)
 		return -1;
 	}
 
+	if (win_shadow_audio_start(subsystem) < 0)
+		WLog_WARN(TAG, "系统声音线程启动失败，继续仅视频会话");
+
 	return 1;
 }
 
+/**
+ * 停止 Windows Shadow 的附属异步任务。
+ *
+ * 视频捕获线程由服务全局停止事件统一退出；系统声音使用独立事件以避免等待下一次音频回调，
+ * 因而此处主动同步停止。参数无效时返回负数，其他情况保证停止操作幂等。
+ */
 static int win_shadow_subsystem_stop(rdpShadowSubsystem* arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;
@@ -603,9 +629,16 @@ static int win_shadow_subsystem_stop(rdpShadowSubsystem* arg)
 	if (!subsystem)
 		return -1;
 
+	win_shadow_audio_stop(subsystem);
 	return 1;
 }
 
+/**
+ * 释放 Windows Shadow 子系统实例。
+ *
+ * FreeRDP 的通用销毁路径可能在显式 Uninit 后再次调用本函数，因此依赖幂等的音频与视频释放
+ * 逻辑。释放完成后不再保留任何线程句柄或格式缓冲区。
+ */
 static void win_shadow_subsystem_free(rdpShadowSubsystem* arg)
 {
 	winShadowSubsystem* subsystem = (winShadowSubsystem*)arg;

@@ -212,8 +212,9 @@ int shadow_server_command_line_status_print(rdpShadowServer* server, int argc, c
  * 解析 Shadow 服务端命令行配置。
  *
  * 此函数在监听器与编码器初始化前运行，将用户输入转换为服务端状态。max-fps 同时约束
- * DXGI 捕获节奏和 H.264 编码帧率，避免捕获速度超过客户端确认能力而产生无效积压。
- * 无效数值返回命令行错误，调用方不得启动部分配置的服务。
+ * DXGI 捕获节奏和 H.264 编码帧率，避免捕获速度超过客户端确认能力而产生无效积压；
+ * system-audio 控制 Windows 系统声音回环，关闭时不创建音频线程。无效数值返回命令行错误，
+ * 调用方不得启动部分配置的服务。
  */
 int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** argv,
                                      COMMAND_LINE_ARGUMENT_A* cargs)
@@ -288,6 +289,10 @@ int shadow_server_parse_command_line(rdpShadowServer* server, int argc, char** a
 		CommandLineSwitchCase(arg, "may-interact")
 		{
 			server->mayInteract = arg->Value != nullptr;
+		}
+		CommandLineSwitchCase(arg, "system-audio")
+		{
+			server->systemAudio = arg->Value != nullptr;
 		}
 		CommandLineSwitchCase(arg, "server-side-cursor")
 		{
@@ -1139,6 +1144,12 @@ int shadow_server_uninit(rdpShadowServer* server)
 	return 1;
 }
 
+/**
+ * 创建带有物理桌面共享默认策略的 Shadow 服务对象。
+ *
+ * 默认监听 3389、允许查看与键鼠交互，并启用可选的系统声音回环；声音设备不可用时由 Windows
+ * 子系统安全降级为视频会话。内存或基础设置创建失败时返回 nullptr，调用方不得继续启动服务。
+ */
 rdpShadowServer* shadow_server_new(void)
 {
 	rdpShadowServer* server = nullptr;
@@ -1151,6 +1162,7 @@ rdpShadowServer* shadow_server_new(void)
 	server->port = 3389;
 	server->mayView = TRUE;
 	server->mayInteract = TRUE;
+	server->systemAudio = TRUE;
 	server->h264RateControlMode = H264_RATECONTROL_VBR;
 	server->h264BitRate = 10000000;
 	server->h264FrameRate = 30;

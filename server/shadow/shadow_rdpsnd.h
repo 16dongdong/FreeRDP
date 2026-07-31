@@ -32,6 +32,16 @@ extern "C"
 	WINPR_ATTR_NODISCARD int shadow_client_rdpsnd_init(rdpShadowClient* client);
 	void shadow_client_rdpsnd_uninit(rdpShadowClient* client);
 
+	/**
+	 * 将已转换为 RDPSND 协商格式的系统音频广播给已激活的 Shadow 客户端。
+	 *
+	 * 数据会在函数内部复制并异步释放，因此调用方可在返回后立即复用捕获缓冲区。格式必须在
+	 * 所有客户端消息处理完成前保持有效；无客户端或格式无效时返回 FALSE。
+	 */
+	WINPR_ATTR_NODISCARD BOOL shadow_client_broadcast_audio_samples(
+	    rdpShadowServer* server, const AUDIO_FORMAT* format, const void* samples, size_t frameCount,
+	    UINT16 timestamp);
+
 #ifdef __cplusplus
 }
 #endif

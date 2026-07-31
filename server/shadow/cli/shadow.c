@@ -32,6 +32,13 @@
 #include <freerdp/log.h>
 #define TAG SERVER_TAG("shadow")
 
+/**
+ * 初始化并运行 Shadow 命令行服务。
+ *
+ * 此入口把命令行参数交给服务端解析器，再负责证书、监听器和日志生命周期；system-audio 默认
+ * 启用但其初始化失败不会改变视频和键鼠控制的退出语义。参数或服务初始化失败时返回非零状态，
+ * 以便计划任务记录可诊断的失败原因。
+ */
 int main(int argc, char** argv)
 {
 	int status = 0;
@@ -57,6 +64,8 @@ int main(int argc, char** argv)
 		  "maximum connections allowed to server, 0 to deactivate" },
 		{ "max-fps", COMMAND_LINE_VALUE_REQUIRED, "<1-60>", nullptr, nullptr, -1, nullptr,
 		  "设置捕获与视频编码的最高帧率；客户端积压时会自动降帧" },
+		{ "system-audio", COMMAND_LINE_VALUE_BOOL, nullptr, BoolValueTrue, nullptr, -1, nullptr,
+		  "采集并重定向 Windows 系统声音" },
 		{ "mouse-relative", COMMAND_LINE_VALUE_BOOL, nullptr, nullptr, nullptr, -1, nullptr,
 		  "enable support for relative mouse events" },
 		{ "rect", COMMAND_LINE_VALUE_REQUIRED, "<x,y,w,h>", nullptr, nullptr, -1, nullptr,

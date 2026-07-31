@@ -34,6 +34,7 @@ typedef struct win_shadow_subsystem winShadowSubsystem;
 #include "win_rdp.h"
 #include "win_wds.h"
 #include "win_dxgi.h"
+#include "win_audio.h"
 
 struct win_shadow_subsystem
 {
@@ -42,6 +43,8 @@ struct win_shadow_subsystem
 	int bpp;
 	int width;
 	int height;
+	HANDLE audioThread;
+	HANDLE audioStopEvent;
 
 #ifdef WITH_WDS_API
 	HWND hWnd;
